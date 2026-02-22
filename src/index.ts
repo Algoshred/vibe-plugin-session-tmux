@@ -6,9 +6,6 @@
  * terminal session management and ttyd for browser-accessible web terminals.
  */
 
-import { execSync } from "node:child_process";
-import { createServer, type Server } from "node:net";
-import { randomBytes } from "node:crypto";
 import type { Subprocess } from "bun";
 
 // ---------------------------------------------------------------------------
@@ -160,18 +157,25 @@ const GRACEFUL_KILL_TIMEOUT_MS = 3000;
  * Generate a short random hex ID (8 chars) for session identifiers.
  */
 function generateId(): string {
-  return randomBytes(4).toString("hex");
+  const bytes = new Uint8Array(4);
+  crypto.getRandomValues(bytes);
+  return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 /**
  * Execute a tmux command and return its stdout. Throws on non-zero exit.
  */
 function tmuxExec(args: string[]): string {
-  const result = execSync(`tmux ${args.map(shellEscape).join(" ")}`, {
-    stdio: ["pipe", "pipe", "pipe"],
+  const result = Bun.spawnSync(["tmux", ...args], {
+    stdout: "pipe",
+    stderr: "pipe",
     timeout: 10_000,
   });
-  return result.toString("utf-8").trimEnd();
+  if (result.exitCode !== 0) {
+    const stderr = result.stderr.toString().trim();
+    throw new Error(`tmux exited with code ${result.exitCode}: ${stderr}`);
+  }
+  return result.stdout.toString("utf-8").trimEnd();
 }
 
 /**
@@ -180,26 +184,15 @@ function tmuxExec(args: string[]): string {
  */
 function tmuxExecSilent(args: string[]): boolean {
   try {
-    execSync(`tmux ${args.map(shellEscape).join(" ")}`, {
-      stdio: ["pipe", "pipe", "pipe"],
+    const result = Bun.spawnSync(["tmux", ...args], {
+      stdout: "pipe",
+      stderr: "pipe",
       timeout: 10_000,
     });
-    return true;
+    return result.exitCode === 0;
   } catch {
     return false;
   }
-}
-
-/**
- * Escape a single shell argument.
- */
-function shellEscape(arg: string): string {
-  // If the arg is already safe, return as-is
-  if (/^[a-zA-Z0-9_./:@=+-]+$/.test(arg)) {
-    return arg;
-  }
-  // Wrap in single quotes, escaping existing single quotes
-  return `'${arg.replace(/'/g, "'\\''")}'`;
 }
 
 /**
@@ -222,14 +215,19 @@ async function findAvailablePort(start: number): Promise<number> {
  */
 function isPortAvailable(port: number): Promise<boolean> {
   return new Promise((resolve) => {
-    const server: Server = createServer();
-    server.once("error", () => {
+    try {
+      const server = Bun.listen({
+        hostname: "127.0.0.1",
+        port,
+        socket: {
+          data() {},
+        },
+      });
+      server.stop(true);
+      resolve(true);
+    } catch {
       resolve(false);
-    });
-    server.once("listening", () => {
-      server.close(() => resolve(true));
-    });
-    server.listen(port, "127.0.0.1");
+    }
   });
 }
 
@@ -396,13 +394,7 @@ class TmuxSessionProvider implements SessionProvider {
     // Apply environment variables
     if (config.environment) {
       for (const [key, value] of Object.entries(config.environment)) {
-        tmuxExecSilent([
-          "set-environment",
-          "-t",
-          sessionName,
-          key,
-          value,
-        ]);
+        tmuxExecSilent(["set-environment", "-t", sessionName, key, value]);
       }
     }
 
@@ -636,13 +628,7 @@ class TmuxSessionProvider implements SessionProvider {
     // Read current mouse setting
     let mouseOn = false;
     try {
-      const value = tmuxExec([
-        "show-options",
-        "-t",
-        tmuxName,
-        "-v",
-        "mouse",
-      ]);
+      const value = tmuxExec(["show-options", "-t", tmuxName, "-v", "mouse"]);
       mouseOn = value.trim() === "on";
     } catch {
       // Default to off if we can't read
@@ -683,10 +669,7 @@ class TmuxSessionProvider implements SessionProvider {
     return this.getRunningTerminalInfo(sessionId);
   }
 
-  async startTerminal(
-    sessionId: string,
-    port?: number,
-  ): Promise<TerminalInfo> {
+  async startTerminal(sessionId: string, port?: number): Promise<TerminalInfo> {
     const session = await this.requireSession(sessionId);
     const tmuxName = this.getTmuxName(session);
 
@@ -834,11 +817,12 @@ class TmuxSessionProvider implements SessionProvider {
 
     // Also look for any orphaned ttyd processes via pgrep
     try {
-      const raw = execSync("pgrep -a ttyd", {
-        encoding: "utf-8",
+      const pgrepResult = Bun.spawnSync(["pgrep", "-a", "ttyd"], {
+        stdout: "pipe",
+        stderr: "pipe",
         timeout: 5000,
-        stdio: ["pipe", "pipe", "pipe"],
-      }).trim();
+      });
+      const raw = pgrepResult.stdout.toString().trim();
 
       if (raw) {
         for (const line of raw.split("\n")) {
@@ -948,12 +932,12 @@ class TmuxSessionProvider implements SessionProvider {
     // Check ttyd availability
     let ttydOk = false;
     try {
-      execSync("which ttyd", {
-        encoding: "utf-8",
+      const whichResult = Bun.spawnSync(["which", "ttyd"], {
+        stdout: "pipe",
+        stderr: "pipe",
         timeout: 5000,
-        stdio: ["pipe", "pipe", "pipe"],
       });
-      ttydOk = true;
+      ttydOk = whichResult.exitCode === 0;
     } catch {
       // ttyd not found
     }
@@ -1076,9 +1060,7 @@ class TmuxSessionProvider implements SessionProvider {
    * defaults to `vibe-{id}`.
    */
   private getTmuxName(session: SessionInfo): string {
-    const meta = session.metadata as
-      | Record<string, unknown>
-      | undefined;
+    const meta = session.metadata as Record<string, unknown> | undefined;
     if (meta && typeof meta.tmuxSessionName === "string") {
       return meta.tmuxSessionName;
     }
@@ -1090,13 +1072,7 @@ class TmuxSessionProvider implements SessionProvider {
    */
   private getSessionPanePid(tmuxName: string): number | null {
     try {
-      const raw = tmuxExec([
-        "list-panes",
-        "-t",
-        tmuxName,
-        "-F",
-        "#{pane_pid}",
-      ]);
+      const raw = tmuxExec(["list-panes", "-t", tmuxName, "-F", "#{pane_pid}"]);
       const pid = parseInt(raw.split("\n")[0] ?? "", 10);
       return isNaN(pid) ? null : pid;
     } catch {

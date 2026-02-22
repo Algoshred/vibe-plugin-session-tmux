@@ -27,19 +27,19 @@ npm install -g @burdenoff/vibe-plugin-session-tmux
 
 This plugin registers a `session` provider with the following capabilities:
 
-| Method | Description |
-| --- | --- |
-| `create(config)` | Create a new tmux session with optional ttyd terminal |
-| `get(id)` | Get session info by ID |
-| `list()` | List all managed sessions |
-| `terminate(id)` | Kill a tmux session and its ttyd process |
-| `execute(id, command)` | Send a command to a tmux session |
-| `capture(id)` | Capture current terminal output |
-| `startTerminal(id)` | Start a ttyd web terminal for a session |
-| `stopTerminal(id)` | Stop the ttyd process for a session |
-| `healthCheck()` | Check tmux and ttyd health |
-| `getSystemSessions()` | List all system tmux sessions |
-| `getSystemTerminals()` | List all running ttyd processes |
+| Method                 | Description                                           |
+| ---------------------- | ----------------------------------------------------- |
+| `create(config)`       | Create a new tmux session with optional ttyd terminal |
+| `get(id)`              | Get session info by ID                                |
+| `list()`               | List all managed sessions                             |
+| `terminate(id)`        | Kill a tmux session and its ttyd process              |
+| `execute(id, command)` | Send a command to a tmux session                      |
+| `capture(id)`          | Capture current terminal output                       |
+| `startTerminal(id)`    | Start a ttyd web terminal for a session               |
+| `stopTerminal(id)`     | Stop the ttyd process for a session                   |
+| `healthCheck()`        | Check tmux and ttyd health                            |
+| `getSystemSessions()`  | List all system tmux sessions                         |
+| `getSystemTerminals()` | List all running ttyd processes                       |
 
 ## Requirements
 
