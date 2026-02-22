@@ -130,6 +130,9 @@ interface VibePlugin {
   name: string;
   version: string;
   description: string;
+  tags?: Array<
+    "backend" | "frontend" | "cli" | "provider" | "adapter" | "integration"
+  >;
   providers: {
     session?: SessionProvider;
   };
@@ -1187,6 +1190,7 @@ const vibePlugin: VibePlugin = {
   version: "1.0.0",
   description:
     "Tmux + ttyd session provider — manages terminal sessions via tmux and exposes web terminals via ttyd",
+  tags: ["backend", "provider"],
 
   providers: {
     session: provider,
