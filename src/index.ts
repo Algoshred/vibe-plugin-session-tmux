@@ -295,9 +295,29 @@ function nowISO(): string {
 class TmuxSessionProvider implements SessionProvider {
   readonly name = PROVIDER_NAME;
 
-  private services!: HostServices;
-  private log!: HostLogger;
-  private storage!: HostStorage;
+  private services: HostServices | null = null;
+
+  /** Logger with safe no-op fallback until init() is called. */
+  private log: HostLogger = {
+    info: () => {},
+    warn: () => {},
+    error: () => {},
+    debug: () => {},
+  };
+
+  /** Storage with safe in-memory fallback until init() is called. */
+  private storage: HostStorage = (() => {
+    const mem = new Map<string, string>();
+    return {
+      get: async (key: string) => mem.get(key) ?? null,
+      set: async (key: string, value: string) => {
+        mem.set(key, value);
+      },
+      delete: async (key: string) => {
+        mem.delete(key);
+      },
+    };
+  })();
 
   /** In-memory map of ttyd child processes keyed by session ID. */
   private ttydProcesses: Map<string, Subprocess> = new Map();
@@ -314,8 +334,8 @@ class TmuxSessionProvider implements SessionProvider {
    */
   async init(services: HostServices): Promise<void> {
     this.services = services;
-    this.log = services.logger;
-    this.storage = services.storage;
+    if (services.logger) this.log = services.logger;
+    if (services.storage) this.storage = services.storage;
 
     this.log.info("TmuxSessionProvider initialising", { provider: this.name });
 
@@ -1168,7 +1188,7 @@ const provider = new TmuxSessionProvider();
 
 const vibePlugin: VibePlugin = {
   name: "@burdenoff/vibe-plugin-session-tmux",
-  version: "1.0.0",
+  version: "2.3.0",
   description:
     "Tmux + ttyd session provider — manages terminal sessions via tmux and exposes web terminals via ttyd",
   tags: ["backend", "provider"],
