@@ -6,7 +6,7 @@
  * terminal session management and ttyd for browser-accessible web terminals.
  */
 
-import { execSync, type SpawnSyncReturns } from "node:child_process";
+import { execSync } from "node:child_process";
 import { createServer, type Server } from "node:net";
 import { randomBytes } from "node:crypto";
 import type { Subprocess } from "bun";
@@ -167,14 +167,10 @@ function generateId(): string {
  * Execute a tmux command and return its stdout. Throws on non-zero exit.
  */
 function tmuxExec(args: string[]): string {
-  const result: SpawnSyncReturns<Buffer> = execSync(
-    `tmux ${args.map(shellEscape).join(" ")}`,
-    {
-      encoding: null as unknown as BufferEncoding,
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: 10_000,
-    },
-  ) as unknown as Buffer;
+  const result = execSync(`tmux ${args.map(shellEscape).join(" ")}`, {
+    stdio: ["pipe", "pipe", "pipe"],
+    timeout: 10_000,
+  });
   return result.toString("utf-8").trimEnd();
 }
 
