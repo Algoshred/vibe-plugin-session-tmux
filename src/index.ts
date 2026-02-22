@@ -388,7 +388,7 @@ class TmuxSessionProvider implements SessionProvider {
         id,
         error: String(err),
       });
-      throw new Error(`Failed to create tmux session: ${err}`);
+      throw new Error(`Failed to create tmux session: ${err}`, { cause: err });
     }
 
     // Apply environment variables
@@ -531,7 +531,10 @@ class TmuxSessionProvider implements SessionProvider {
         sessionId,
         error: String(err),
       });
-      throw new Error(`Failed to send command to session ${sessionId}: ${err}`);
+      throw new Error(
+        `Failed to send command to session ${sessionId}: ${err}`,
+        { cause: err },
+      );
     }
   }
 
@@ -547,7 +550,9 @@ class TmuxSessionProvider implements SessionProvider {
         sessionId,
         error: String(err),
       });
-      throw new Error(`Failed to send keys to session ${sessionId}: ${err}`);
+      throw new Error(`Failed to send keys to session ${sessionId}: ${err}`, {
+        cause: err,
+      });
     }
   }
 
@@ -565,6 +570,7 @@ class TmuxSessionProvider implements SessionProvider {
       });
       throw new Error(
         `Failed to send interrupt to session ${sessionId}: ${err}`,
+        { cause: err },
       );
     }
   }
@@ -584,6 +590,7 @@ class TmuxSessionProvider implements SessionProvider {
       });
       throw new Error(
         `Failed to capture output from session ${sessionId}: ${err}`,
+        { cause: err },
       );
     }
   }
@@ -613,7 +620,9 @@ class TmuxSessionProvider implements SessionProvider {
         sessionId,
         error: String(err),
       });
-      throw new Error(`Failed to rename session ${sessionId}: ${err}`);
+      throw new Error(`Failed to rename session ${sessionId}: ${err}`, {
+        cause: err,
+      });
     }
 
     // Also rename the tmux session for cosmetic purposes
@@ -626,7 +635,7 @@ class TmuxSessionProvider implements SessionProvider {
     const tmuxName = this.getTmuxName(session);
 
     // Read current mouse setting
-    let mouseOn = false;
+    let mouseOn: boolean;
     try {
       const value = tmuxExec(["show-options", "-t", tmuxName, "-v", "mouse"]);
       mouseOn = value.trim() === "on";
@@ -905,8 +914,8 @@ class TmuxSessionProvider implements SessionProvider {
   // -----------------------------------------------------------------------
 
   async healthCheck(): Promise<HealthCheckResult> {
-    let tmuxOk = false;
-    let tmuxVersion = "";
+    let tmuxOk: boolean;
+    let tmuxVersion: string;
     let sessionCount = 0;
     const terminalCount = this.ttydProcesses.size;
 
