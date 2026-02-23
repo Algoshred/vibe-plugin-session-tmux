@@ -95,6 +95,19 @@ interface SessionProvider {
   healthCheck(): Promise<HealthCheckResult>;
   getSessionsByProject(projectId: string): Promise<SessionInfo[]>;
   cleanup(): Promise<{ cleaned: number }>;
+
+  // Core agent interface aliases (routes use these names)
+  get(sessionId: string): Promise<SessionInfo | null>;
+  kill(sessionId: string): Promise<void>;
+  interrupt(sessionId: string): Promise<void>;
+  capture(
+    sessionId: string,
+    options?: { lines?: number; pane?: string },
+  ): Promise<string>;
+  resize(sessionId: string, cols: number, rows: number): Promise<void>;
+  listSystem(): Promise<SystemSessionInfo[]>;
+  killSystem(sessionId: string): Promise<void>;
+  killSystemTerminal(pid: number): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -109,9 +122,9 @@ interface HostLogger {
 }
 
 interface HostStorage {
-  get(key: string): Promise<string | null>;
-  set(key: string, value: string): Promise<void>;
-  delete(key: string): Promise<void>;
+  get(namespace: string, key: string): Promise<string | null>;
+  set(namespace: string, key: string, value: string): Promise<void>;
+  delete(namespace: string, key: string): Promise<boolean>;
 }
 
 interface HostServices {
@@ -309,12 +322,13 @@ class TmuxSessionProvider implements SessionProvider {
   private storage: HostStorage = (() => {
     const mem = new Map<string, string>();
     return {
-      get: async (key: string) => mem.get(key) ?? null,
-      set: async (key: string, value: string) => {
-        mem.set(key, value);
+      get: async (namespace: string, key: string) =>
+        mem.get(`${namespace}:${key}`) ?? null,
+      set: async (namespace: string, key: string, value: string) => {
+        mem.set(`${namespace}:${key}`, value);
       },
-      delete: async (key: string) => {
-        mem.delete(key);
+      delete: async (namespace: string, key: string) => {
+        return mem.delete(`${namespace}:${key}`);
       },
     };
   })();
@@ -1028,6 +1042,62 @@ class TmuxSessionProvider implements SessionProvider {
   }
 
   // -----------------------------------------------------------------------
+  // Core agent interface aliases
+  // The core SessionProvider interface uses these names; delegate to our
+  // implementations so the session routes work correctly.
+  // -----------------------------------------------------------------------
+
+  async get(sessionId: string): Promise<SessionInfo | null> {
+    return this.getInfo(sessionId);
+  }
+
+  async kill(sessionId: string): Promise<void> {
+    return this.terminate(sessionId);
+  }
+
+  async interrupt(sessionId: string): Promise<void> {
+    return this.sendInterrupt(sessionId);
+  }
+
+  async capture(sessionId: string): Promise<string> {
+    return this.captureOutput(sessionId);
+  }
+
+  async resize(sessionId: string, cols: number, rows: number): Promise<void> {
+    const session = await this.requireSession(sessionId);
+    const tmuxName = this.getTmuxName(session);
+    tmuxExecSilent([
+      "resize-window",
+      "-t",
+      tmuxName,
+      "-x",
+      String(cols),
+      "-y",
+      String(rows),
+    ]);
+  }
+
+  async listSystem(): Promise<SystemSessionInfo[]> {
+    return this.listSystemSessions();
+  }
+
+  async killSystem(sessionId: string): Promise<void> {
+    tmuxExecSilent(["kill-session", "-t", sessionId]);
+  }
+
+  async killSystemTerminal(pid: number): Promise<void> {
+    await gracefulKill(pid);
+    // Remove from tracked processes if present
+    for (const [sessionId, child] of this.ttydProcesses) {
+      if (child.pid === pid) {
+        this.ttydProcesses.delete(sessionId);
+        this.ttydPorts.delete(sessionId);
+        break;
+      }
+    }
+  }
+
+  // -----------------------------------------------------------------------
   // Private helpers — storage
   // -----------------------------------------------------------------------
 
@@ -1037,7 +1107,8 @@ class TmuxSessionProvider implements SessionProvider {
   private async loadSessions(): Promise<SessionInfo[]> {
     try {
       const raw = await this.storage.get(
-        `${STORAGE_NAMESPACE}:${STORAGE_KEY_SESSIONS}`,
+        STORAGE_NAMESPACE,
+        STORAGE_KEY_SESSIONS,
       );
       if (!raw) return [];
       return JSON.parse(raw) as SessionInfo[];
@@ -1055,7 +1126,8 @@ class TmuxSessionProvider implements SessionProvider {
   private async saveSessions(sessions: SessionInfo[]): Promise<void> {
     try {
       await this.storage.set(
-        `${STORAGE_NAMESPACE}:${STORAGE_KEY_SESSIONS}`,
+        STORAGE_NAMESPACE,
+        STORAGE_KEY_SESSIONS,
         JSON.stringify(sessions),
       );
     } catch (err) {
