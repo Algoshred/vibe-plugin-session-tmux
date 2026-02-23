@@ -734,10 +734,14 @@ class TmuxSessionProvider implements SessionProvider {
       port: assignedPort,
     });
 
-    // Spawn ttyd process
+    // Spawn ttyd process with theme options for proper rendering
     const child = Bun.spawn(
       [
         "ttyd",
+        "-t",
+        "fontSize=14",
+        "-t",
+        `theme={"background":"#1e1e1e","foreground":"#cccccc"}`,
         "--writable",
         "--port",
         String(assignedPort),
