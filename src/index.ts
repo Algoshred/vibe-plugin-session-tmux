@@ -15,6 +15,8 @@ import type { Subprocess } from "bun";
 type SessionStatus = "active" | "inactive" | "terminated" | "error";
 
 interface SessionConfig {
+  /** Optional external ID (e.g. backend UUID). If provided the plugin uses it instead of generating one. */
+  id?: string;
   name: string;
   command?: string;
   workingDirectory?: string;
@@ -389,8 +391,8 @@ class TmuxSessionProvider implements SessionProvider {
   // -----------------------------------------------------------------------
 
   async create(config: SessionConfig): Promise<SessionInfo> {
-    const id = generateId();
-    const sessionName = `vibe-${id}`;
+    const id = config.id || generateId();
+    const sessionName = `vibe-${id.substring(0, 8)}`;
     const now = nowISO();
 
     this.log.info("Creating tmux session", {
