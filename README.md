@@ -1,6 +1,6 @@
 # @burdenoff/vibe-plugin-session-tmux
 
-Tmux + ttyd session provider plugin for [VibeControls Agent](https://www.npmjs.com/package/@burdenoff/vibe-agent).
+Tmux + ttyd session provider plugin for [VibeControls Agent](https://www.npmjs.com/package/@vibecontrols/agent).
 
 ## Installation
 
