@@ -734,7 +734,11 @@ class TmuxSessionProvider implements SessionProvider {
       port: assignedPort,
     });
 
-    // Spawn ttyd process with theme options for proper rendering
+    // Spawn ttyd process with theme options for proper rendering.
+    // Set VIBECONTROLS_PROVIDER so the shell can identify the provider.
+    const ttydEnv: Record<string, string | undefined> = { ...process.env };
+    ttydEnv.VIBECONTROLS_PROVIDER = "tmux";
+
     const child = Bun.spawn(
       [
         "ttyd",
@@ -754,6 +758,7 @@ class TmuxSessionProvider implements SessionProvider {
         stdout: "ignore",
         stderr: "ignore",
         stdin: "ignore",
+        env: ttydEnv as Record<string, string>,
       },
     );
 
