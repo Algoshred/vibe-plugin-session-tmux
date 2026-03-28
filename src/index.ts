@@ -734,10 +734,22 @@ class TmuxSessionProvider implements SessionProvider {
       port: assignedPort,
     });
 
-    // Spawn ttyd process with theme options for proper rendering.
-    // Set VIBECONTROLS_PROVIDER so the shell can identify the provider.
+    // Build the ttyd shell environment.
+    // Set tmux-identifying vars, and strip other providers' vars if the
+    // agent happens to run inside wezterm/screen/zellij.
     const ttydEnv: Record<string, string | undefined> = { ...process.env };
     ttydEnv.VIBECONTROLS_PROVIDER = "tmux";
+
+    const otherProviderVars: Record<string, string[]> = {
+      wezterm: ["WEZTERM_PANE", "WEZTERM_UNIX_SOCKET"],
+      screen: ["STY", "WINDOW"],
+      zellij: ["ZELLIJ", "ZELLIJ_SESSION_NAME", "ZELLIJ_PANE_ID"],
+    };
+    for (const vars of Object.values(otherProviderVars)) {
+      for (const v of vars) {
+        if (v in ttydEnv) delete ttydEnv[v];
+      }
+    }
 
     const child = Bun.spawn(
       [
