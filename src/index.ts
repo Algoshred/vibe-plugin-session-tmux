@@ -148,7 +148,7 @@ interface VibePlugin {
   providers: {
     session?: SessionProvider;
   };
-  onServerStart?(services: HostServices): Promise<void>;
+  onServerStart?(_app: unknown, services: HostServices): Promise<void>;
   onServerStop?(): Promise<void>;
   onCliSetup?(): void;
 }
@@ -1292,7 +1292,7 @@ const vibePlugin: VibePlugin = {
     session: provider,
   },
 
-  async onServerStart(services: HostServices): Promise<void> {
+  async onServerStart(_app: unknown, services: HostServices): Promise<void> {
     await provider.init(services);
   },
 
