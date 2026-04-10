@@ -110,6 +110,30 @@ interface SessionProvider {
   listSystem(): Promise<SystemSessionInfo[]>;
   killSystem(sessionId: string): Promise<void>;
   killSystemTerminal(pid: number): Promise<void>;
+
+  // Optional capability & extended capture methods
+  getCapabilities?(): SessionProviderCapabilities;
+  getScrollback?(sessionId: string, lines: number): Promise<string>;
+  searchOutput?(
+    sessionId: string,
+    pattern: string,
+  ): Promise<Array<{ line: number; content: string }>>;
+}
+
+interface SessionProviderCapabilities {
+  provider: string;
+  features: {
+    mouse: boolean;
+    resize: boolean;
+    capture: boolean;
+    webTerminal: boolean;
+    splitPanes: boolean;
+    tabs: boolean;
+    scrollback: boolean;
+    clipboard: boolean;
+    search: boolean;
+  };
+  platform: string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -1129,6 +1153,86 @@ class TmuxSessionProvider implements SessionProvider {
   }
 
   // -----------------------------------------------------------------------
+  // Capability & extended capture methods
+  // -----------------------------------------------------------------------
+
+  getCapabilities(): SessionProviderCapabilities {
+    return {
+      provider: "tmux",
+      features: {
+        mouse: true,
+        resize: true,
+        capture: true,
+        webTerminal: true,
+        splitPanes: true,
+        tabs: false,
+        scrollback: true,
+        clipboard: true,
+        search: true,
+      },
+      platform: ["linux", "macos"],
+    };
+  }
+
+  async getScrollback(sessionId: string, lines: number): Promise<string> {
+    const session = await this.requireSession(sessionId);
+    const tmuxName = this.getTmuxName(session);
+
+    this.log.debug("Getting scrollback", { sessionId, lines });
+    try {
+      const output = tmuxExec([
+        "capture-pane",
+        "-t",
+        tmuxName,
+        "-p",
+        "-S",
+        `-${lines}`,
+      ]);
+      return output;
+    } catch (err) {
+      this.log.error("Failed to get scrollback", {
+        sessionId,
+        error: String(err),
+      });
+      throw new Error(`Failed to get scrollback for session ${sessionId}: ${err}`, {
+        cause: err,
+      });
+    }
+  }
+
+  async searchOutput(
+    sessionId: string,
+    pattern: string,
+  ): Promise<Array<{ line: number; content: string }>> {
+    // Capture a large scrollback buffer and search through it
+    const scrollback = await this.getScrollback(sessionId, 10000);
+    const lines = scrollback.split("\n");
+    const results: Array<{ line: number; content: string }> = [];
+
+    let regex: RegExp;
+    try {
+      regex = new RegExp(pattern);
+    } catch {
+      // Fall back to literal string match if pattern is not valid regex
+      regex = new RegExp(pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    }
+
+    for (let i = 0; i < lines.length; i++) {
+      if (regex.test(lines[i] ?? "")) {
+        results.push({ line: i + 1, content: lines[i] ?? "" });
+      }
+    }
+
+    this.log.debug("Search output completed", {
+      sessionId,
+      pattern,
+      matches: results.length,
+    });
+
+    return results;
+  }
+
+  // -----------------------------------------------------------------------
   // Private helpers — storage
   // -----------------------------------------------------------------------
 
@@ -1456,6 +1560,7 @@ const vibePlugin: VibePlugin = {
 export { vibePlugin };
 export type {
   SessionProvider,
+  SessionProviderCapabilities,
   SessionConfig,
   SessionInfo,
   SessionStatus,
