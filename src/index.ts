@@ -169,9 +169,18 @@ interface VibePlugin {
   tags?: Array<
     "backend" | "frontend" | "cli" | "provider" | "adapter" | "integration"
   >;
+  apiPrefix?: string;
+  prerequisites?: Array<{
+    name: string;
+    kind: "binary" | "npm" | "pip" | "cargo" | "manual";
+    requiresSudo: boolean;
+    description?: string;
+  }>;
   providers: {
     session?: SessionProvider;
   };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  createRoutes?(deps?: unknown): any;
   onServerStart?(_app: unknown, services: HostServices): Promise<void>;
   onServerStop?(context?: { reason: "reload" | "shutdown" }): Promise<void>;
   onCliSetup?(): void;
@@ -1535,16 +1544,77 @@ class TmuxSessionProvider implements SessionProvider {
 
 const provider = new TmuxSessionProvider();
 
+// ── Prereq protocol ──────────────────────────────────────────────────────
+
+import { Elysia } from "elysia";
+import { spawnSync as spawnSyncForPrereqs } from "node:child_process";
+
+function whichSync(bin: string): string | null {
+  const r = spawnSyncForPrereqs("which", [bin], { encoding: "utf8" });
+  if (r.status === 0) return r.stdout.trim() || null;
+  return null;
+}
+
+function createPrereqsRoutes() {
+  const checks = ["tmux", "ttyd"];
+  const installCmds: Record<string, string> = {
+    tmux:
+      process.platform === "darwin"
+        ? "brew install tmux"
+        : "sudo apt-get install -y tmux",
+    ttyd:
+      process.platform === "darwin"
+        ? "brew install ttyd"
+        : "sudo apt-get install -y ttyd",
+  };
+
+  return new Elysia({ prefix: "/prereqs" })
+    .get("/status", () => {
+      const missing = checks
+        .filter((bin) => !whichSync(bin))
+        .map((name) => ({
+          name,
+          kind: "binary" as const,
+          requiresSudo: true,
+        }));
+      return { satisfied: missing.length === 0, missing };
+    })
+    .post("/install", () => {
+      const pendingSudo = checks
+        .filter((bin) => !whichSync(bin))
+        .map((name) => ({
+          name,
+          command: installCmds[name] ?? `(see install docs for ${name})`,
+          reason: `${name} is required for tmux session backend.`,
+        }));
+      return {
+        ok: true,
+        installed: [],
+        pendingSudo,
+        errors: [],
+      };
+    })
+    .post("/uninstall", () => ({ ok: true }));
+}
+
 const vibePlugin: VibePlugin = {
-  name: "@burdenoff/vibe-plugin-session-tmux",
+  name: "session-tmux",
   version: "2.3.0",
   description:
     "Tmux + ttyd session provider — manages terminal sessions via tmux and exposes web terminals via ttyd",
   tags: ["backend", "provider"],
+  apiPrefix: "/api/session-tmux",
+
+  prerequisites: [
+    { name: "tmux", kind: "binary", requiresSudo: true, description: "Terminal multiplexer" },
+    { name: "ttyd", kind: "binary", requiresSudo: true, description: "Web terminal bridge" },
+  ],
 
   providers: {
     session: provider,
   },
+
+  createRoutes: () => createPrereqsRoutes(),
 
   async onServerStart(_app: unknown, services: HostServices): Promise<void> {
     await provider.init(services);
