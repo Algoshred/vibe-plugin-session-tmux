@@ -1203,9 +1203,12 @@ class TmuxSessionProvider implements SessionProvider {
         sessionId,
         error: String(err),
       });
-      throw new Error(`Failed to get scrollback for session ${sessionId}: ${err}`, {
-        cause: err,
-      });
+      throw new Error(
+        `Failed to get scrollback for session ${sessionId}: ${err}`,
+        {
+          cause: err,
+        },
+      );
     }
   }
 
@@ -1606,8 +1609,18 @@ const vibePlugin: VibePlugin = {
   apiPrefix: "/api/session-tmux",
 
   prerequisites: [
-    { name: "tmux", kind: "binary", requiresSudo: true, description: "Terminal multiplexer" },
-    { name: "ttyd", kind: "binary", requiresSudo: true, description: "Web terminal bridge" },
+    {
+      name: "tmux",
+      kind: "binary",
+      requiresSudo: true,
+      description: "Terminal multiplexer",
+    },
+    {
+      name: "ttyd",
+      kind: "binary",
+      requiresSudo: true,
+      description: "Web terminal bridge",
+    },
   ],
 
   providers: {
