@@ -24,6 +24,8 @@ interface SessionConfig {
   shell?: string;
   size?: { cols: number; rows: number };
   projectId?: string;
+  /** Optional provider-native session name. See manager docs. */
+  externalName?: string;
 }
 
 interface SessionInfo {
@@ -118,6 +120,18 @@ interface SessionProvider {
     sessionId: string,
     pattern: string,
   ): Promise<Array<{ line: number; content: string }>>;
+
+  // Optional orphan discovery / adoption (daemon-backed providers)
+  discoverOrphans?(): Promise<OrphanSessionInfo[]>;
+  adopt?(externalName: string, displayName?: string): Promise<SessionInfo>;
+}
+
+interface OrphanSessionInfo {
+  externalName: string;
+  provider: string;
+  windows: number;
+  attached: boolean;
+  createdAt?: string;
 }
 
 interface SessionProviderCapabilities {
@@ -435,6 +449,67 @@ class TmuxSessionProvider implements SessionProvider {
   // -----------------------------------------------------------------------
 
   async create(config: SessionConfig): Promise<SessionInfo> {
+    // Attach-or-create: if caller supplied a provider-native name and a
+    // matching tmux session already exists on the host, hand off to
+    // adopt() so the agent and any external tmux user share the same
+    // session. If no match, create with that exact name.
+    if (config.externalName) {
+      const target = config.externalName;
+      if (target.length === 0 || target.length > 128 || /[\0\r\n:.\s]/.test(target)) {
+        throw new Error(`Invalid externalName: ${target}`);
+      }
+      if (tmuxExecSilent(["has-session", "-t", target])) {
+        this.log.info("create(): attaching to existing tmux session", {
+          target,
+        });
+        return this.adopt(target, config.name);
+      }
+      // No matching session — create with the exact requested name.
+      const now = nowISO();
+      const args: string[] = ["new-session", "-d", "-s", target];
+      if (config.workingDirectory) args.push("-c", config.workingDirectory);
+      if (config.size)
+        args.push("-x", String(config.size.cols), "-y", String(config.size.rows));
+      if (config.shell) args.push(config.shell);
+      tmuxExec(args);
+      if (config.environment) {
+        for (const [k, v] of Object.entries(config.environment)) {
+          tmuxExecSilent(["set-environment", "-t", target, k, v]);
+        }
+      }
+      tmuxExecSilent(["set", "-t", target, "mouse", "on"]);
+      if (config.command)
+        tmuxExecSilent(["send-keys", "-t", target, config.command, "Enter"]);
+      const id = target.startsWith("vibe-")
+        ? target.slice(5) || target
+        : target;
+      const pid = this.getSessionPanePid(target);
+      const info: SessionInfo = {
+        id,
+        name: config.name,
+        status: "active",
+        provider: this.name,
+        command: config.command,
+        workingDirectory: config.workingDirectory,
+        pid: pid ?? undefined,
+        projectId: config.projectId,
+        createdAt: now,
+        updatedAt: now,
+        metadata: {
+          tmuxSessionName: target,
+          shell: config.shell,
+          size: config.size,
+          createdWithExplicitName: true,
+        },
+      };
+      await this.saveSession(info);
+      this.log.info("Tmux session created with explicit name", {
+        id,
+        target,
+      });
+      return info;
+    }
+
     const id = config.id || generateId();
     const sessionName = `vibe-${id.substring(0, 8)}`;
     const now = nowISO();
@@ -1163,6 +1238,109 @@ class TmuxSessionProvider implements SessionProvider {
         break;
       }
     }
+  }
+
+  // -----------------------------------------------------------------------
+  // Orphan discovery & adoption
+  // Tmux is a daemon — it survives agent kills. When a fresh agent starts
+  // (or storage is wiped), `vibe-*` tmux sessions on the host become
+  // invisible to the UI. These two helpers expose them so users can
+  // reconnect from the UI instead of losing work.
+  // -----------------------------------------------------------------------
+
+  /**
+   * List `vibe-*` tmux sessions on the host that are NOT currently tracked
+   * by this provider's storage. Returns the raw tmux session metadata so
+   * the UI can present them in a "reconnect" picker.
+   */
+  async discoverOrphans(): Promise<OrphanSessionInfo[]> {
+    const known = new Set(
+      (await this.loadSessions())
+        .filter((s) => s.status !== "terminated")
+        .map((s) => this.getTmuxName(s)),
+    );
+    const sys = await this.listSystemSessions();
+    return sys
+      .filter((s) => s.name.startsWith("vibe-") && !known.has(s.name))
+      .map((s) => ({
+        externalName: s.name,
+        provider: "tmux",
+        windows: s.windows,
+        attached: s.attached,
+        createdAt: s.createdAt,
+      }));
+  }
+
+  /**
+   * Adopt an existing tmux session into this provider's storage. Creates
+   * a SessionInfo record keyed off the tmux name (id = tmux name minus
+   * `vibe-` prefix), and starts a ttyd terminal so the UI can attach.
+   * Idempotent: if the session is already tracked, returns the existing
+   * record instead of throwing.
+   */
+  async adopt(
+    externalName: string,
+    displayName?: string,
+  ): Promise<SessionInfo> {
+    const tmuxName = externalName;
+    if (!tmuxName.startsWith("vibe-")) {
+      throw new Error(
+        `Refusing to adopt tmux session "${tmuxName}" — only vibe-* sessions are adoptable`,
+      );
+    }
+    if (!tmuxExecSilent(["has-session", "-t", tmuxName])) {
+      throw new Error(`Tmux session "${tmuxName}" does not exist`);
+    }
+
+    const id = tmuxName.slice("vibe-".length) || tmuxName;
+
+    // Idempotent: if already tracked, no-op + ensure ttyd is up.
+    const existing = (await this.loadSessions()).find((s) => s.id === id);
+    if (existing) {
+      this.log.info("Adopt: session already tracked", { id, tmuxName });
+      if (!this.ttydPids.has(id)) {
+        try {
+          await this.startTerminal(id);
+        } catch (err) {
+          this.log.warn("Adopt: failed to start ttyd for tracked session", {
+            id,
+            error: String(err),
+          });
+        }
+      }
+      return (await this.getInfo(id)) ?? existing;
+    }
+
+    const now = nowISO();
+    const pid = this.getSessionPanePid(tmuxName);
+    const info: SessionInfo = {
+      id,
+      name: displayName || tmuxName,
+      status: "active",
+      provider: this.name,
+      pid: pid ?? undefined,
+      createdAt: now,
+      updatedAt: now,
+      metadata: {
+        tmuxSessionName: tmuxName,
+        adopted: true,
+      },
+    };
+    await this.saveSession(info);
+    this.log.info("Adopted orphan tmux session", { id, tmuxName });
+
+    // Best-effort ttyd spawn so the user can immediately attach.
+    try {
+      const term = await this.startTerminal(id);
+      info.terminal = term;
+      await this.saveSession(info);
+    } catch (err) {
+      this.log.warn("Adopt: ttyd start failed (session still adopted)", {
+        id,
+        error: String(err),
+      });
+    }
+    return info;
   }
 
   // -----------------------------------------------------------------------
