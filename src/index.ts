@@ -168,6 +168,9 @@ interface HostStorage {
 }
 
 interface HostServices {
+  telemetry?: {
+    emit: (name: string, payload?: Record<string, unknown>) => void;
+  };
   logger: HostLogger;
   storage: HostStorage;
 }
@@ -176,7 +179,18 @@ interface HostServices {
 // VibePlugin interface
 // ---------------------------------------------------------------------------
 
+interface PluginCapabilities {
+  storage?: "none" | "read" | "rw";
+  secrets?: "none" | "read" | "rw";
+  gateway?: boolean;
+  broadcast?: boolean;
+  subprocess?: boolean;
+  audit?: boolean;
+  telemetry?: boolean;
+}
+
 interface VibePlugin {
+  capabilities?: PluginCapabilities;
   name: string;
   version: string;
   description: string;
@@ -1788,6 +1802,11 @@ function createPrereqsRoutes() {
 }
 
 const vibePlugin: VibePlugin = {
+  capabilities: {
+    storage: "rw",
+    subprocess: true,
+    telemetry: true,
+  },
   name: "session-tmux",
   version: "2.3.0",
   description:
@@ -1817,6 +1836,14 @@ const vibePlugin: VibePlugin = {
   createRoutes: () => createPrereqsRoutes(),
 
   async onServerStart(_app: unknown, services: HostServices): Promise<void> {
+    // tmux is POSIX-only — it does not run on Windows. Skip registration there.
+    if (process.platform === "win32") {
+      console.warn(
+        "  Plugin 'session-tmux' is not supported on Windows — skipping init.",
+      );
+      return;
+    }
+    services?.telemetry?.emit("session.provider.ready", { provider: "tmux" });
     await provider.init(services);
   },
 
