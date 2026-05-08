@@ -1126,18 +1126,11 @@ class TmuxSessionProvider implements SessionProvider {
     }
 
     // Check ttyd availability
+    // (tmux/ttyd themselves are POSIX-only — Windows users should run
+    // this plugin under WSL2 — but the discovery probe stays portable.)
     let ttydOk = false;
     try {
-      // Cross-platform: `which` on POSIX, `where.exe` on Windows.
-      // (tmux/ttyd themselves are POSIX-only — Windows users should run
-      // this plugin under WSL2 — but the discovery probe stays portable.)
-      const finder = process.platform === "win32" ? "where.exe" : "which";
-      const whichResult = Bun.spawnSync([finder, "ttyd"], {
-        stdout: "pipe",
-        stderr: "pipe",
-        timeout: 5000,
-      });
-      ttydOk = whichResult.exitCode === 0;
+      ttydOk = Bun.which("ttyd") !== null;
     } catch {
       // ttyd not found
     }
@@ -1746,17 +1739,10 @@ const provider = new TmuxSessionProvider();
 // ── Prereq protocol ──────────────────────────────────────────────────────
 
 import { Elysia } from "elysia";
-import { spawnSync as spawnSyncForPrereqs } from "node:child_process";
 
-// Cross-platform: `which` on POSIX, `where.exe` on Windows.
+// Cross-platform binary discovery via Bun.which (handles PATHEXT on Windows).
 function whichSync(bin: string): string | null {
-  const finder = process.platform === "win32" ? "where.exe" : "which";
-  const r = spawnSyncForPrereqs(finder, [bin], { encoding: "utf8" });
-  if (r.status !== 0) return null;
-  const first = String(r.stdout ?? "")
-    .split(/\r?\n/)[0]
-    ?.trim();
-  return first || null;
+  return Bun.which(bin) ?? null;
 }
 
 function createPrereqsRoutes() {
