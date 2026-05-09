@@ -4,12 +4,30 @@
  * Tmux + ttyd session provider plugin for VibeControls Agent.
  * Implements the full SessionProvider interface (23 methods) using tmux for
  * terminal session management and ttyd for browser-accessible web terminals.
+ *
+ * Migrated to consume @vibecontrols/plugin-sdk@2026.509.1 — inline contract
+ * stubs and subprocess/storage helpers replaced by SDK imports.
  */
 
-// No Subprocess import needed — we track PIDs only for restart resilience
+import { Elysia } from "elysia";
+import type {
+  HostServices,
+  VibePlugin,
+} from "@vibecontrols/plugin-sdk/contract";
+import { createLifecycleHooks } from "@vibecontrols/plugin-sdk/lifecycle";
+import { TypedStore } from "@vibecontrols/plugin-sdk/storage";
+import {
+  findAvailablePort,
+  gracefulKill,
+  isProcessAlive,
+  sleep,
+} from "@vibecontrols/plugin-sdk/subprocess";
+import { BoundLogger } from "@vibecontrols/plugin-sdk/log";
+import { TelemetryEmitter } from "@vibecontrols/plugin-sdk/telemetry";
+import { ProviderRegistry } from "@vibecontrols/plugin-sdk/providers";
 
 // ---------------------------------------------------------------------------
-// Types
+// Plugin-local types (session domain — not part of SDK contract)
 // ---------------------------------------------------------------------------
 
 type SessionStatus = "active" | "inactive" | "terminated" | "error";
@@ -151,79 +169,17 @@ interface SessionProviderCapabilities {
 }
 
 // ---------------------------------------------------------------------------
-// HostServices — provided by the vibe-agent runtime at plugin load
-// ---------------------------------------------------------------------------
-
-interface HostLogger {
-  info(message: string, meta?: Record<string, unknown>): void;
-  warn(message: string, meta?: Record<string, unknown>): void;
-  error(message: string, meta?: Record<string, unknown>): void;
-  debug(message: string, meta?: Record<string, unknown>): void;
-}
-
-interface HostStorage {
-  get(namespace: string, key: string): Promise<string | null>;
-  set(namespace: string, key: string, value: string): Promise<void>;
-  delete(namespace: string, key: string): Promise<boolean>;
-}
-
-interface HostServices {
-  telemetry?: {
-    emit: (name: string, payload?: Record<string, unknown>) => void;
-  };
-  logger: HostLogger;
-  storage: HostStorage;
-}
-
-// ---------------------------------------------------------------------------
-// VibePlugin interface
-// ---------------------------------------------------------------------------
-
-interface PluginCapabilities {
-  storage?: "none" | "read" | "rw";
-  secrets?: "none" | "read" | "rw";
-  gateway?: boolean;
-  broadcast?: boolean;
-  subprocess?: boolean;
-  audit?: boolean;
-  telemetry?: boolean;
-}
-
-interface VibePlugin {
-  capabilities?: PluginCapabilities;
-  name: string;
-  version: string;
-  description: string;
-  tags?: Array<
-    "backend" | "frontend" | "cli" | "provider" | "adapter" | "integration"
-  >;
-  apiPrefix?: string;
-  prerequisites?: Array<{
-    name: string;
-    kind: "binary" | "npm" | "pip" | "cargo" | "manual";
-    requiresSudo: boolean;
-    description?: string;
-  }>;
-  providers: {
-    session?: SessionProvider;
-  };
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  createRoutes?(deps?: unknown): any;
-  onServerStart?(_app: unknown, services: HostServices): Promise<void>;
-  onServerStop?(context?: { reason: "reload" | "shutdown" }): Promise<void>;
-  onCliSetup?(): void;
-}
-
-// ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
+const PLUGIN_NAME = "session-tmux";
+const PLUGIN_VERSION = "2.3.0";
 const PROVIDER_NAME = "session-tmux";
 const STORAGE_NAMESPACE = "session-tmux";
 const STORAGE_KEY_SESSIONS = "sessions";
+const STORAGE_KEY_TERMINALS = "terminals";
 const TTYD_BASE_PORT = 7681;
 const TTYD_PORT_RANGE = 200;
-const GRACEFUL_KILL_TIMEOUT_MS = 3000;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -272,92 +228,6 @@ function tmuxExecSilent(args: string[]): boolean {
 }
 
 /**
- * Find an available TCP port starting from `start` within the configured range.
- */
-async function findAvailablePort(start: number): Promise<number> {
-  for (let port = start; port < start + TTYD_PORT_RANGE; port++) {
-    const available = await isPortAvailable(port);
-    if (available) {
-      return port;
-    }
-  }
-  throw new Error(
-    `No available port found in range ${start}-${start + TTYD_PORT_RANGE - 1}`,
-  );
-}
-
-/**
- * Check whether a TCP port is available by attempting to bind to it.
- */
-function isPortAvailable(port: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    try {
-      const server = Bun.listen({
-        hostname: "127.0.0.1",
-        port,
-        socket: {
-          data() {},
-        },
-      });
-      server.stop(true);
-      resolve(true);
-    } catch {
-      resolve(false);
-    }
-  });
-}
-
-/**
- * Send SIGTERM to a process, then SIGKILL after timeout if still alive.
- */
-async function gracefulKill(
-  pid: number,
-  timeout: number = GRACEFUL_KILL_TIMEOUT_MS,
-): Promise<void> {
-  try {
-    process.kill(pid, "SIGTERM");
-  } catch {
-    // Process already dead — nothing to do
-    return;
-  }
-
-  const deadline = Date.now() + timeout;
-
-  while (Date.now() < deadline) {
-    await sleep(200);
-    if (!isProcessAlive(pid)) {
-      return;
-    }
-  }
-
-  // Force kill
-  try {
-    process.kill(pid, "SIGKILL");
-  } catch {
-    // Already gone
-  }
-}
-
-/**
- * Check if a process is still alive.
- */
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Simple async sleep.
- */
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/**
  * Get the current ISO timestamp.
  */
 function nowISO(): string {
@@ -368,33 +238,21 @@ function nowISO(): string {
 // TmuxSessionProvider
 // ---------------------------------------------------------------------------
 
+interface PersistedTerminal {
+  pid: number;
+  port: number;
+}
+
 class TmuxSessionProvider implements SessionProvider {
   readonly name = PROVIDER_NAME;
 
-  private services: HostServices | null = null;
+  /** Logger — bound to plugin source; no-op until init() supplies host logger. */
+  private log: BoundLogger = new BoundLogger(undefined, PLUGIN_NAME);
 
-  /** Logger with safe no-op fallback until init() is called. */
-  private log: HostLogger = {
-    info: () => {},
-    warn: () => {},
-    error: () => {},
-    debug: () => {},
-  };
-
-  /** Storage with safe in-memory fallback until init() is called. */
-  private storage: HostStorage = (() => {
-    const mem = new Map<string, string>();
-    return {
-      get: async (namespace: string, key: string) =>
-        mem.get(`${namespace}:${key}`) ?? null,
-      set: async (namespace: string, key: string, value: string) => {
-        mem.set(`${namespace}:${key}`, value);
-      },
-      delete: async (namespace: string, key: string) => {
-        return mem.delete(`${namespace}:${key}`);
-      },
-    };
-  })();
+  /** TypedStore handles — assigned in init() once host storage is available. */
+  private sessionsStore: TypedStore<SessionInfo[]> | null = null;
+  private terminalsStore: TypedStore<Record<string, PersistedTerminal>> | null =
+    null;
 
   /** In-memory map of ttyd PIDs keyed by session ID. */
   private ttydPids: Map<string, number> = new Map();
@@ -410,9 +268,24 @@ class TmuxSessionProvider implements SessionProvider {
    * Initialise the provider with host services. Called from onServerStart.
    */
   async init(services: HostServices): Promise<void> {
-    this.services = services;
-    if (services.logger) this.log = services.logger;
-    if (services.storage) this.storage = services.storage;
+    this.log = new BoundLogger(services.logger, PLUGIN_NAME);
+
+    if (services.storage) {
+      this.sessionsStore = new TypedStore<SessionInfo[]>(
+        services.storage,
+        STORAGE_NAMESPACE,
+        STORAGE_KEY_SESSIONS,
+        services.logger,
+        PLUGIN_NAME,
+      );
+      this.terminalsStore = new TypedStore<Record<string, PersistedTerminal>>(
+        services.storage,
+        STORAGE_NAMESPACE,
+        STORAGE_KEY_TERMINALS,
+        services.logger,
+        PLUGIN_NAME,
+      );
+    }
 
     this.log.info("TmuxSessionProvider initialising", { provider: this.name });
 
@@ -451,7 +324,7 @@ class TmuxSessionProvider implements SessionProvider {
     }
     await Promise.allSettled(stopPromises);
     try {
-      await this.storage.delete(STORAGE_NAMESPACE, "terminals");
+      await this.terminalsStore?.delete();
     } catch {
       /* ignore */
     }
@@ -469,7 +342,11 @@ class TmuxSessionProvider implements SessionProvider {
     // session. If no match, create with that exact name.
     if (config.externalName) {
       const target = config.externalName;
-      if (target.length === 0 || target.length > 128 || /[\0\r\n:.\s]/.test(target)) {
+      if (
+        target.length === 0 ||
+        target.length > 128 ||
+        /[\0\r\n:.\s]/.test(target)
+      ) {
         throw new Error(`Invalid externalName: ${target}`);
       }
       if (tmuxExecSilent(["has-session", "-t", target])) {
@@ -483,7 +360,12 @@ class TmuxSessionProvider implements SessionProvider {
       const args: string[] = ["new-session", "-d", "-s", target];
       if (config.workingDirectory) args.push("-c", config.workingDirectory);
       if (config.size)
-        args.push("-x", String(config.size.cols), "-y", String(config.size.rows));
+        args.push(
+          "-x",
+          String(config.size.cols),
+          "-y",
+          String(config.size.rows),
+        );
       if (config.shell) args.push(config.shell);
       tmuxExec(args);
       if (config.environment) {
@@ -858,8 +740,9 @@ class TmuxSessionProvider implements SessionProvider {
       return existing;
     }
 
-    // Find available port
-    const assignedPort = port ?? (await findAvailablePort(TTYD_BASE_PORT));
+    // Find available port via SDK helper
+    const assignedPort =
+      port ?? (await findAvailablePort(TTYD_BASE_PORT, TTYD_PORT_RANGE));
 
     this.log.info("Starting ttyd terminal", {
       sessionId,
@@ -1193,8 +1076,6 @@ class TmuxSessionProvider implements SessionProvider {
 
   // -----------------------------------------------------------------------
   // Core agent interface aliases
-  // The core SessionProvider interface uses these names; delegate to our
-  // implementations so the session routes work correctly.
   // -----------------------------------------------------------------------
 
   async get(sessionId: string): Promise<SessionInfo | null> {
@@ -1249,17 +1130,8 @@ class TmuxSessionProvider implements SessionProvider {
 
   // -----------------------------------------------------------------------
   // Orphan discovery & adoption
-  // Tmux is a daemon — it survives agent kills. When a fresh agent starts
-  // (or storage is wiped), `vibe-*` tmux sessions on the host become
-  // invisible to the UI. These two helpers expose them so users can
-  // reconnect from the UI instead of losing work.
   // -----------------------------------------------------------------------
 
-  /**
-   * List `vibe-*` tmux sessions on the host that are NOT currently tracked
-   * by this provider's storage. Returns the raw tmux session metadata so
-   * the UI can present them in a "reconnect" picker.
-   */
   async discoverOrphans(): Promise<OrphanSessionInfo[]> {
     const known = new Set(
       (await this.loadSessions())
@@ -1278,13 +1150,6 @@ class TmuxSessionProvider implements SessionProvider {
       }));
   }
 
-  /**
-   * Adopt an existing tmux session into this provider's storage. Creates
-   * a SessionInfo record keyed off the tmux name (id = tmux name minus
-   * `vibe-` prefix), and starts a ttyd terminal so the UI can attach.
-   * Idempotent: if the session is already tracked, returns the existing
-   * record instead of throwing.
-   */
   async adopt(
     externalName: string,
     displayName?: string,
@@ -1434,38 +1299,19 @@ class TmuxSessionProvider implements SessionProvider {
   }
 
   // -----------------------------------------------------------------------
-  // Private helpers — storage
+  // Private helpers — storage (TypedStore-backed)
   // -----------------------------------------------------------------------
 
-  /**
-   * Load all session records from persistent storage.
-   */
   private async loadSessions(): Promise<SessionInfo[]> {
-    try {
-      const raw = await this.storage.get(
-        STORAGE_NAMESPACE,
-        STORAGE_KEY_SESSIONS,
-      );
-      if (!raw) return [];
-      return JSON.parse(raw) as SessionInfo[];
-    } catch (err) {
-      this.log.error("Failed to load sessions from storage", {
-        error: String(err),
-      });
-      return [];
-    }
+    if (!this.sessionsStore) return [];
+    const data = await this.sessionsStore.get();
+    return data ?? [];
   }
 
-  /**
-   * Save the full session list to persistent storage.
-   */
   private async saveSessions(sessions: SessionInfo[]): Promise<void> {
+    if (!this.sessionsStore) return;
     try {
-      await this.storage.set(
-        STORAGE_NAMESPACE,
-        STORAGE_KEY_SESSIONS,
-        JSON.stringify(sessions),
-      );
+      await this.sessionsStore.set(sessions);
     } catch (err) {
       this.log.error("Failed to save sessions to storage", {
         error: String(err),
@@ -1473,9 +1319,6 @@ class TmuxSessionProvider implements SessionProvider {
     }
   }
 
-  /**
-   * Save (upsert) a single session record.
-   */
   private async saveSession(session: SessionInfo): Promise<void> {
     const sessions = await this.loadSessions();
     const idx = sessions.findIndex((s) => s.id === session.id);
@@ -1491,11 +1334,6 @@ class TmuxSessionProvider implements SessionProvider {
   // Private helpers — tmux utilities
   // -----------------------------------------------------------------------
 
-  /**
-   * Extract the tmux session name from a SessionInfo record.
-   * The tmux session name is stored in metadata.tmuxSessionName or
-   * defaults to `vibe-{id}`.
-   */
   private getTmuxName(session: SessionInfo): string {
     const meta = session.metadata as Record<string, unknown> | undefined;
     if (meta && typeof meta.tmuxSessionName === "string") {
@@ -1504,9 +1342,6 @@ class TmuxSessionProvider implements SessionProvider {
     return `vibe-${session.id}`;
   }
 
-  /**
-   * Get the PID of the first pane in a tmux session.
-   */
   private getSessionPanePid(tmuxName: string): number | null {
     try {
       const raw = tmuxExec(["list-panes", "-t", tmuxName, "-F", "#{pane_pid}"]);
@@ -1517,9 +1352,6 @@ class TmuxSessionProvider implements SessionProvider {
     }
   }
 
-  /**
-   * Look up a session by ID and throw if not found.
-   */
   private async requireSession(sessionId: string): Promise<SessionInfo> {
     const session = await this.getInfo(sessionId);
     if (!session) {
@@ -1542,7 +1374,7 @@ class TmuxSessionProvider implements SessionProvider {
       return null;
     }
 
-    // Verify process is still alive
+    // Verify process is still alive (SDK helper)
     if (!isProcessAlive(pid)) {
       this.ttydPids.delete(sessionId);
       this.ttydPorts.delete(sessionId);
@@ -1557,7 +1389,8 @@ class TmuxSessionProvider implements SessionProvider {
   }
 
   private async persistTerminals(): Promise<void> {
-    const data: Record<string, { pid: number; port: number }> = {};
+    if (!this.terminalsStore) return;
+    const data: Record<string, PersistedTerminal> = {};
     for (const [sessionId, pid] of this.ttydPids) {
       const port = this.ttydPorts.get(sessionId);
       if (port !== undefined) {
@@ -1565,26 +1398,18 @@ class TmuxSessionProvider implements SessionProvider {
       }
     }
     try {
-      await this.storage.set(
-        STORAGE_NAMESPACE,
-        "terminals",
-        JSON.stringify(data),
-      );
+      await this.terminalsStore.set(data);
     } catch {
       this.log.warn("Failed to persist terminal state");
     }
   }
 
   private async loadPersistedTerminals(): Promise<
-    Record<string, { pid: number; port: number }>
+    Record<string, PersistedTerminal>
   > {
-    try {
-      const raw = await this.storage.get(STORAGE_NAMESPACE, "terminals");
-      if (!raw) return {};
-      return JSON.parse(raw);
-    } catch {
-      return {};
-    }
+    if (!this.terminalsStore) return {};
+    const data = await this.terminalsStore.get();
+    return data ?? {};
   }
 
   /**
@@ -1736,10 +1561,6 @@ class TmuxSessionProvider implements SessionProvider {
 
 const provider = new TmuxSessionProvider();
 
-// ── Prereq protocol ──────────────────────────────────────────────────────
-
-import { Elysia } from "elysia";
-
 // Cross-platform binary discovery via Bun.which (handles PATHEXT on Windows).
 function whichSync(bin: string): string | null {
   return Bun.which(bin) ?? null;
@@ -1787,14 +1608,39 @@ function createPrereqsRoutes() {
     .post("/uninstall", () => ({ ok: true }));
 }
 
+// Lifecycle hooks via SDK — auto-emits `<plugin>.ready` telemetry,
+// skips init on Windows (tmux is POSIX-only), delegates to provider.
+const lifecycle = createLifecycleHooks({
+  name: PLUGIN_NAME,
+  skipPlatforms: ["win32"],
+  telemetryEventName: `${PLUGIN_NAME}.ready`,
+  onInit: async (services) => {
+    // Provider registration via SDK — graceful no-op when registry absent.
+    new ProviderRegistry(services).registerProvider(
+      "session",
+      PROVIDER_NAME,
+      provider,
+    );
+    // Plugin-specific ready emit (preserves prior `session.provider.ready` event).
+    new TelemetryEmitter(PLUGIN_NAME, PLUGIN_VERSION, services).emit(
+      "session.provider.ready",
+      { provider: "tmux" },
+    );
+    await provider.init(services);
+  },
+  onShutdown: async () => {
+    await provider.shutdown({ reason: "shutdown" });
+  },
+});
+
 const vibePlugin: VibePlugin = {
   capabilities: {
     storage: "rw",
     subprocess: true,
     telemetry: true,
   },
-  name: "session-tmux",
-  version: "2.3.0",
+  name: PLUGIN_NAME,
+  version: PLUGIN_VERSION,
   description:
     "Tmux + ttyd session provider — manages terminal sessions via tmux and exposes web terminals via ttyd",
   tags: ["backend", "provider"],
@@ -1805,39 +1651,17 @@ const vibePlugin: VibePlugin = {
       name: "tmux",
       kind: "binary",
       requiresSudo: true,
-      description: "Terminal multiplexer",
     },
     {
       name: "ttyd",
       kind: "binary",
       requiresSudo: true,
-      description: "Web terminal bridge",
     },
   ],
 
-  providers: {
-    session: provider,
-  },
-
   createRoutes: () => createPrereqsRoutes(),
-
-  async onServerStart(_app: unknown, services: HostServices): Promise<void> {
-    // tmux is POSIX-only — it does not run on Windows. Skip registration there.
-    if (process.platform === "win32") {
-      console.warn(
-        "  Plugin 'session-tmux' is not supported on Windows — skipping init.",
-      );
-      return;
-    }
-    services?.telemetry?.emit("session.provider.ready", { provider: "tmux" });
-    await provider.init(services);
-  },
-
-  async onServerStop(context?: {
-    reason: "reload" | "shutdown";
-  }): Promise<void> {
-    await provider.shutdown(context);
-  },
+  onServerStart: lifecycle.onServerStart,
+  onServerStop: lifecycle.onServerStop,
 };
 
 export { vibePlugin };
@@ -1851,6 +1675,4 @@ export type {
   HealthCheckResult,
   SystemSessionInfo,
   SystemTerminalInfo,
-  VibePlugin,
-  HostServices,
 };
