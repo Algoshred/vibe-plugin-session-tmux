@@ -12,7 +12,9 @@
 import { Elysia } from "elysia";
 import type {
   HostServices,
+  ProfileContext,
   VibePlugin,
+  VibePluginFactory,
 } from "@vibecontrols/plugin-sdk/contract";
 import { createLifecycleHooks } from "@vibecontrols/plugin-sdk/lifecycle";
 import { TypedStore } from "@vibecontrols/plugin-sdk/storage";
@@ -1559,6 +1561,9 @@ class TmuxSessionProvider implements SessionProvider {
 // Plugin export
 // ---------------------------------------------------------------------------
 
+// Provider is a process-wide singleton — tmux+ttyd PIDs are global OS
+// resources, so even if the factory ran multiple times we'd want to share
+// the same provider instance to avoid double-spawning ttyd.
 const provider = new TmuxSessionProvider();
 
 // Cross-platform binary discovery via Bun.which (handles PATHEXT on Windows).
@@ -1608,63 +1613,73 @@ function createPrereqsRoutes() {
     .post("/uninstall", () => ({ ok: true }));
 }
 
-// Lifecycle hooks via SDK — auto-emits `<plugin>.ready` telemetry,
-// skips init on Windows (tmux is POSIX-only), delegates to provider.
-const lifecycle = createLifecycleHooks({
-  name: PLUGIN_NAME,
-  skipPlatforms: ["win32"],
-  telemetryEventName: `${PLUGIN_NAME}.ready`,
-  onInit: async (services) => {
-    // Provider registration via SDK — graceful no-op when registry absent.
-    new ProviderRegistry(services).registerProvider(
-      "session",
-      PROVIDER_NAME,
-      provider,
-    );
-    // Plugin-specific ready emit (preserves prior `session.provider.ready` event).
-    new TelemetryEmitter(PLUGIN_NAME, PLUGIN_VERSION, services).emit(
-      "session.provider.ready",
-      { provider: "tmux" },
-    );
-    await provider.init(services);
-  },
-  onShutdown: async () => {
-    await provider.shutdown({ reason: "shutdown" });
-  },
-});
-
-const vibePlugin: VibePlugin = {
-  capabilities: {
-    storage: "rw",
-    subprocess: true,
-    telemetry: true,
-  },
-  name: PLUGIN_NAME,
-  version: PLUGIN_VERSION,
-  description:
-    "Tmux + ttyd session provider — manages terminal sessions via tmux and exposes web terminals via ttyd",
-  tags: ["backend", "provider"],
-  apiPrefix: "/api/session-tmux",
-
-  prerequisites: [
-    {
-      name: "tmux",
-      kind: "binary",
-      requiresSudo: true,
+/**
+ * Plugin contract V2 factory. The agent calls this once per profile at
+ * load time. Lifecycle hooks and the VibePlugin object are constructed
+ * fresh per-call so that any per-profile context can be captured if
+ * needed in the future. The underlying provider is a process-wide
+ * singleton (see comment above) since tmux/ttyd PIDs are global.
+ */
+export const createPlugin: VibePluginFactory = (
+  _ctx: ProfileContext,
+): VibePlugin => {
+  // Lifecycle hooks via SDK — auto-emits `<plugin>.ready` telemetry,
+  // skips init on Windows (tmux is POSIX-only), delegates to provider.
+  const lifecycle = createLifecycleHooks({
+    name: PLUGIN_NAME,
+    skipPlatforms: ["win32"],
+    telemetryEventName: `${PLUGIN_NAME}.ready`,
+    onInit: async (services: HostServices) => {
+      // Provider registration via SDK — graceful no-op when registry absent.
+      new ProviderRegistry(services).registerProvider(
+        "session",
+        PROVIDER_NAME,
+        provider,
+      );
+      // Plugin-specific ready emit (preserves prior `session.provider.ready` event).
+      new TelemetryEmitter(PLUGIN_NAME, PLUGIN_VERSION, services).emit(
+        "session.provider.ready",
+        { provider: "tmux" },
+      );
+      await provider.init(services);
     },
-    {
-      name: "ttyd",
-      kind: "binary",
-      requiresSudo: true,
+    onShutdown: async () => {
+      await provider.shutdown({ reason: "shutdown" });
     },
-  ],
+  });
 
-  createRoutes: () => createPrereqsRoutes(),
-  onServerStart: lifecycle.onServerStart,
-  onServerStop: lifecycle.onServerStop,
+  return {
+    capabilities: {
+      storage: "rw",
+      subprocess: true,
+      telemetry: true,
+    },
+    name: PLUGIN_NAME,
+    version: PLUGIN_VERSION,
+    description:
+      "Tmux + ttyd session provider — manages terminal sessions via tmux and exposes web terminals via ttyd",
+    tags: ["backend", "provider"],
+    apiPrefix: "/api/session-tmux",
+
+    prerequisites: [
+      {
+        name: "tmux",
+        kind: "binary",
+        requiresSudo: true,
+      },
+      {
+        name: "ttyd",
+        kind: "binary",
+        requiresSudo: true,
+      },
+    ],
+
+    createRoutes: () => createPrereqsRoutes(),
+    onServerStart: lifecycle.onServerStart,
+    onServerStop: lifecycle.onServerStop,
+  };
 };
 
-export { vibePlugin };
 export type {
   SessionProvider,
   SessionProviderCapabilities,
