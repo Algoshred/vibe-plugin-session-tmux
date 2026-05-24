@@ -483,11 +483,14 @@ class TmuxSessionProvider implements SessionProvider {
     // users perceive this as "the terminal is frozen / I can't type". ttyd
     // renders whatever tmux draws, so we surface a prominent banner on the
     // pane's top border whenever copy-mode is active, and hide it otherwise.
-    // The pane-mode-changed hook is scoped to this session so it never leaks
-    // into unrelated tmux sessions on the same server.
+    // Both the format and the pane-mode-changed hook are scoped to this
+    // session (`set -t` / `set-hook -t`) so neither leaks into unrelated
+    // tmux sessions on the same server. (`set -g` would overwrite the
+    // pane-border-format globally for every session on the tmux server.)
     tmuxExecSilent([
       "set",
-      "-g",
+      "-t",
+      sessionName,
       "pane-border-format",
       " #[align=centre]#[bg=colour208,fg=black,bold] ⬆ SCROLL MODE — press Esc or q to resume typing ⬆ #[default]",
     ]);
