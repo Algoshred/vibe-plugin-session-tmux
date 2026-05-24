@@ -418,30 +418,52 @@ class TmuxSessionProvider implements SessionProvider {
       sessionName,
     });
 
-    // Build tmux new-session command
-    const args: string[] = ["new-session", "-d", "-s", sessionName];
+    // Resume-safe: if a tmux session with this name is already alive — the
+    // agent restarted but tmux kept running, or the svc marked the session
+    // "stopped" after a transient tunnel drop — reuse it instead of calling
+    // `new-session`, which fails with "duplicate session" and leaves the
+    // session unrecoverable ("No terminal URL available" in the UI). We keep
+    // the caller's full `id` so the record continues to match the backend.
+    const alreadyRunning = tmuxExecSilent(["has-session", "-t", sessionName]);
 
-    if (config.workingDirectory) {
-      args.push("-c", config.workingDirectory);
-    }
-
-    if (config.size) {
-      args.push("-x", String(config.size.cols), "-y", String(config.size.rows));
-    }
-
-    // If a shell is specified, use it as the window command
-    if (config.shell) {
-      args.push(config.shell);
-    }
-
-    try {
-      tmuxExec(args);
-    } catch (err) {
-      this.log.error("Failed to create tmux session", {
+    if (alreadyRunning) {
+      this.log.info("Reusing existing tmux session on resume", {
         id,
-        error: String(err),
+        sessionName,
       });
-      throw new Error(`Failed to create tmux session: ${err}`, { cause: err });
+    } else {
+      // Build tmux new-session command
+      const args: string[] = ["new-session", "-d", "-s", sessionName];
+
+      if (config.workingDirectory) {
+        args.push("-c", config.workingDirectory);
+      }
+
+      if (config.size) {
+        args.push(
+          "-x",
+          String(config.size.cols),
+          "-y",
+          String(config.size.rows),
+        );
+      }
+
+      // If a shell is specified, use it as the window command
+      if (config.shell) {
+        args.push(config.shell);
+      }
+
+      try {
+        tmuxExec(args);
+      } catch (err) {
+        this.log.error("Failed to create tmux session", {
+          id,
+          error: String(err),
+        });
+        throw new Error(`Failed to create tmux session: ${err}`, {
+          cause: err,
+        });
+      }
     }
 
     // Apply environment variables
@@ -454,8 +476,33 @@ class TmuxSessionProvider implements SessionProvider {
     // Enable mouse by default
     tmuxExecSilent(["set", "-t", sessionName, "mouse", "on"]);
 
-    // If an initial command is given, send it
-    if (config.command) {
+    // Scroll-mode (copy-mode) banner.
+    //
+    // With mouse on, scrolling up puts the pane in tmux copy-mode, where
+    // keystrokes drive selection/navigation instead of reaching the shell —
+    // users perceive this as "the terminal is frozen / I can't type". ttyd
+    // renders whatever tmux draws, so we surface a prominent banner on the
+    // pane's top border whenever copy-mode is active, and hide it otherwise.
+    // The pane-mode-changed hook is scoped to this session so it never leaks
+    // into unrelated tmux sessions on the same server.
+    tmuxExecSilent([
+      "set",
+      "-g",
+      "pane-border-format",
+      " #[align=centre]#[bg=colour208,fg=black,bold] ⬆ SCROLL MODE — press Esc or q to resume typing ⬆ #[default]",
+    ]);
+    tmuxExecSilent([
+      "set-hook",
+      "-t",
+      sessionName,
+      "pane-mode-changed",
+      'if -F "#{pane_in_mode}" "set-option -w pane-border-status top" "set-option -w pane-border-status off"',
+    ]);
+
+    // If an initial command is given, send it — but only for a freshly
+    // created session. Never re-inject the command into a tmux we adopted on
+    // resume; the original process is already running there.
+    if (config.command && !alreadyRunning) {
       tmuxExecSilent(["send-keys", "-t", sessionName, config.command, "Enter"]);
     }
 
