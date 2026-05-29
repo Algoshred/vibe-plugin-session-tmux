@@ -1,5 +1,5 @@
 /**
- * @burdenoff/vibe-plugin-session-tmux
+ * @vibecontrols/vibe-plugin-session-tmux
  *
  * Tmux + ttyd session provider plugin for VibeControls Agent.
  * Implements the full SessionProvider interface (23 methods) using tmux for
