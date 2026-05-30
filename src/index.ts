@@ -333,6 +333,88 @@ class TmuxSessionProvider implements SessionProvider {
     this.log.info("TmuxSessionProvider shutdown complete");
   }
 
+  /**
+   * Full teardown for `vibe nuke`. Reaps every terminal-server (ttyd)
+   * process this plugin spawned — both the in-memory tracked ones and any
+   * surviving ttyd still attached to a vibe-* tmux session — then wipes the
+   * plugin's persisted storage namespace (sessions + terminals).
+   *
+   * Deliberately conservative about tmux: a nuke does NOT kill the user's
+   * tmux server or user-created tmux sessions. We only reap the
+   * agent-spawned ttyd terminal servers and clear our own storage; orphaned
+   * tmux sessions (if any) are left for the user to reap explicitly.
+   *
+   * @returns the number of ttyd processes reaped.
+   */
+  async nuke(): Promise<{ terminalsReaped: number }> {
+    this.log.info("TmuxSessionProvider nuke — reaping spawned terminals");
+
+    // 1. Reap the ttyd processes we are currently tracking in memory. Reuse
+    //    the existing per-terminal teardown so PID/port maps + the terminals
+    //    store stay consistent.
+    const tracked = [...this.ttydPids.keys()];
+    let terminalsReaped = 0;
+    await Promise.allSettled(
+      tracked.map(async (sessionId) => {
+        const pid = this.ttydPids.get(sessionId);
+        await this.stopTerminal(sessionId);
+        if (pid !== undefined) terminalsReaped++;
+      }),
+    );
+
+    // 2. Belt-and-braces: reap any ttyd still attached to one of OUR vibe-*
+    //    tmux sessions that we did not have tracked in memory (e.g. spawned
+    //    before a daemon restart). We scope strictly to ttyd whose command
+    //    line is `tmux attach -t vibe-*` so we never touch a ttyd the user
+    //    started for an unrelated terminal.
+    try {
+      const pgrepResult = Bun.spawnSync(["pgrep", "-a", "ttyd"], {
+        stdout: "pipe",
+        stderr: "pipe",
+        timeout: 5000,
+      });
+      const raw = pgrepResult.stdout.toString().trim();
+      if (raw) {
+        const stillTracked = new Set(this.ttydPids.values());
+        for (const line of raw.split("\n")) {
+          const parts = line.trim().split(/\s+/);
+          const pid = parseInt(parts[0] ?? "0", 10);
+          if (!pid || stillTracked.has(pid)) continue;
+          const tIdx = parts.indexOf("-t");
+          const tmuxTarget = tIdx !== -1 ? parts[tIdx + 1] : null;
+          if (!tmuxTarget || !tmuxTarget.startsWith("vibe-")) continue;
+          if (!isProcessAlive(pid)) continue;
+          this.log.info("Reaping untracked ttyd attached to vibe session", {
+            pid,
+            tmuxTarget,
+          });
+          await gracefulKill(pid);
+          terminalsReaped++;
+        }
+      }
+    } catch {
+      // pgrep absent or no ttyd processes — nothing to sweep.
+    }
+
+    this.ttydPids.clear();
+    this.ttydPorts.clear();
+
+    // 3. Wipe the plugin's persisted storage namespace (both keys).
+    try {
+      await this.terminalsStore?.delete();
+    } catch {
+      /* ignore */
+    }
+    try {
+      await this.sessionsStore?.delete();
+    } catch {
+      /* ignore */
+    }
+
+    this.log.info("TmuxSessionProvider nuke complete", { terminalsReaped });
+    return { terminalsReaped };
+  }
+
   // -----------------------------------------------------------------------
   // SessionProvider — create / terminate / getInfo / list
   // -----------------------------------------------------------------------
@@ -1696,6 +1778,25 @@ export const createPlugin: VibePluginFactory = (
     onShutdown: async () => {
       await provider.shutdown({ reason: "shutdown" });
     },
+    // `vibe nuke` runs this while the daemon is still up, so the provider
+    // singleton + its in-memory ttyd PID map are reachable. Reap every
+    // terminal-server (ttyd) process this plugin spawned and wipe its
+    // storage namespace. We stay conservative about tmux — the user's tmux
+    // server and sessions are left alone. The agent never names tmux/ttyd;
+    // that knowledge lives here.
+    onNuke: async (_hostServices: HostServices, ctx) => {
+      if (ctx.dryRun) {
+        return {
+          reaped: ["ttyd terminal servers + session-tmux storage"],
+        };
+      }
+      const { terminalsReaped } = await provider.nuke();
+      return {
+        reaped: [
+          `${terminalsReaped} ttyd terminal server${terminalsReaped === 1 ? "" : "s"} + session-tmux storage`,
+        ],
+      };
+    },
   });
 
   return {
@@ -1727,6 +1828,7 @@ export const createPlugin: VibePluginFactory = (
     createRoutes: () => createPrereqsRoutes(),
     onServerStart: lifecycle.onServerStart,
     onServerStop: lifecycle.onServerStop,
+    onNuke: lifecycle.onNuke,
   };
 };
 
