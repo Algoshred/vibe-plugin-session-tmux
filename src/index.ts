@@ -27,6 +27,12 @@ import {
 import { BoundLogger } from "@vibecontrols/plugin-sdk/log";
 import { TelemetryEmitter } from "@vibecontrols/plugin-sdk/telemetry";
 import { ProviderRegistry } from "@vibecontrols/plugin-sdk/providers";
+import {
+  installBinary,
+  resolveBinary,
+  type BinaryDownload,
+  type ToolPlatform,
+} from "@vibecontrols/plugin-sdk/install";
 
 // ---------------------------------------------------------------------------
 // Plugin-local types (session domain — not part of SDK contract)
@@ -67,7 +73,67 @@ interface TerminalInfo {
   url: string;
   port: number;
   pid: number;
+  /**
+   * Loopback host the terminal server (ttyd) listens on. The agent's terminal
+   * proxy connects here so it never has to assume a backend. ttyd binds to
+   * 127.0.0.1.
+   */
+  host?: string;
+  /**
+   * WebSocket path ttyd exposes for the live PTY stream. The agent proxies the
+   * browser WS to `ws://{host}:{port}{wsPath}` without hardcoding the backend.
+   * ttyd serves the PTY at `/ws`.
+   */
+  wsPath?: string;
+  /**
+   * WebSocket subprotocols ttyd negotiates. The agent forwards these verbatim,
+   * so it never hardcodes a provider-specific subprotocol. ttyd uses `["tty"]`.
+   */
+  subprotocols?: string[];
 }
+
+/**
+ * ttyd (tsl0922/ttyd) ships raw static binaries on its GitHub releases for
+ * Linux (x86_64 / aarch64) and Windows. There is NO static macOS binary, so
+ * darwin-* is deliberately omitted — `installBinary` throws there and the
+ * `/prereqs/install` handler falls back to the manual `brew install ttyd`
+ * instruction.
+ */
+const TTYD_DOWNLOADS: Partial<Record<ToolPlatform, BinaryDownload>> = {
+  "linux-x64": {
+    url: "https://github.com/tsl0922/ttyd/releases/latest/download/ttyd.x86_64",
+    archive: "raw",
+  },
+  "linux-arm64": {
+    url: "https://github.com/tsl0922/ttyd/releases/latest/download/ttyd.aarch64",
+    archive: "raw",
+  },
+  "win32-x64": {
+    url: "https://github.com/tsl0922/ttyd/releases/latest/download/ttyd.win32.exe",
+    archive: "raw",
+  },
+};
+
+/**
+ * Resolve the ttyd binary path. Prefers the provider-managed cache (absolute
+ * path, immune to the PATH snapshot `Bun.which` takes at process start — the
+ * reason a freshly-downloaded ttyd was invisible to the running daemon), then
+ * the bare name so the OS resolves it from PATH (or gives a sensible "command
+ * not found").
+ */
+function resolveTtydCmd(): string {
+  return (
+    resolveBinary("ttyd") ??
+    (process.platform === "win32" ? "ttyd.exe" : "ttyd")
+  );
+}
+
+/** The loopback host ttyd binds to — the agent's terminal proxy connects here. */
+const TTYD_HOST = "127.0.0.1";
+/** WebSocket path ttyd serves the live PTY at. */
+const TTYD_WS_PATH = "/ws";
+/** WebSocket subprotocol ttyd negotiates for the PTY stream. */
+const TTYD_SUBPROTOCOLS: readonly string[] = ["tty"];
 
 interface HealthCheckResult {
   ok: boolean;
@@ -903,7 +969,7 @@ class TmuxSessionProvider implements SessionProvider {
 
     const child = Bun.spawn(
       [
-        "ttyd",
+        resolveTtydCmd(),
         "-t",
         "fontSize=14",
         "-t",
@@ -940,6 +1006,9 @@ class TmuxSessionProvider implements SessionProvider {
       url: `http://localhost:${assignedPort}`,
       port: assignedPort,
       pid: child.pid,
+      host: TTYD_HOST,
+      wsPath: TTYD_WS_PATH,
+      subprotocols: [...TTYD_SUBPROTOCOLS],
     };
 
     // Update session record with terminal info
@@ -1147,7 +1216,9 @@ class TmuxSessionProvider implements SessionProvider {
     // this plugin under WSL2 — but the discovery probe stays portable.)
     let ttydOk = false;
     try {
-      ttydOk = Bun.which("ttyd") !== null;
+      // Prefer the provider-managed cache (absolute path, immune to the
+      // Bun.which PATH snapshot) then fall back to a PATH lookup.
+      ttydOk = resolveBinary("ttyd") !== null || Bun.which("ttyd") !== null;
     } catch {
       // ttyd not found
     }
@@ -1519,6 +1590,9 @@ class TmuxSessionProvider implements SessionProvider {
       url: `http://localhost:${port}`,
       port,
       pid,
+      host: TTYD_HOST,
+      wsPath: TTYD_WS_PATH,
+      subprotocols: [...TTYD_SUBPROTOCOLS],
     };
   }
 
@@ -1596,6 +1670,9 @@ class TmuxSessionProvider implements SessionProvider {
             url: `http://localhost:${termData.port}`,
             port: termData.port,
             pid: termData.pid,
+            host: TTYD_HOST,
+            wsPath: TTYD_WS_PATH,
+            subprotocols: [...TTYD_SUBPROTOCOLS],
           };
           session.status = "active";
           session.updatedAt = nowISO();
@@ -1666,6 +1743,9 @@ class TmuxSessionProvider implements SessionProvider {
             url: `http://localhost:${port}`,
             port,
             pid,
+            host: TTYD_HOST,
+            wsPath: TTYD_WS_PATH,
+            subprotocols: [...TTYD_SUBPROTOCOLS],
           };
           matchedSession.status = "active";
           matchedSession.updatedAt = nowISO();
@@ -1703,43 +1783,92 @@ function whichSync(bin: string): string | null {
   return Bun.which(bin) ?? null;
 }
 
-function createPrereqsRoutes() {
-  const checks = ["tmux", "ttyd"];
-  const installCmds: Record<string, string> = {
-    tmux:
-      process.platform === "darwin"
-        ? "brew install tmux"
-        : "sudo apt-get install -y tmux",
-    ttyd:
-      process.platform === "darwin"
-        ? "brew install ttyd"
-        : "sudo apt-get install -y ttyd",
-  };
+/** Manual install instruction for ttyd when auto-download is unavailable. */
+function ttydManualInstall(): string {
+  return process.platform === "darwin"
+    ? "brew install ttyd"
+    : process.platform === "win32"
+      ? "winget install tsl0922.ttyd    # or download from https://github.com/tsl0922/ttyd/releases"
+      : "sudo apt-get install -y ttyd    # or build from source: https://github.com/tsl0922/ttyd";
+}
 
+/** Manual install instruction for tmux (package-manager only — never auto-downloaded). */
+function tmuxManualInstall(): string {
+  return process.platform === "darwin"
+    ? "brew install tmux"
+    : "sudo apt-get install -y tmux";
+}
+
+function createPrereqsRoutes() {
   return new Elysia({ prefix: "/prereqs" })
     .get("/status", () => {
-      const missing = checks
-        .filter((bin) => !whichSync(bin))
-        .map((name) => ({
-          name,
-          kind: "binary" as const,
-          requiresSudo: true,
-        }));
+      // ttyd is resolvable from the provider-managed cache (absolute path,
+      // immune to the Bun.which PATH snapshot) or PATH. tmux is PATH-only —
+      // it's package-manager-installed, never auto-downloaded by this plugin.
+      const ttydOk = resolveBinary("ttyd") !== null || !!whichSync("ttyd");
+      const tmuxOk = !!whichSync("tmux");
+      const missing: Array<{
+        name: string;
+        kind: "binary";
+        requiresSudo: boolean;
+      }> = [];
+      if (!tmuxOk) {
+        missing.push({ name: "tmux", kind: "binary", requiresSudo: true });
+      }
+      if (!ttydOk) {
+        missing.push({ name: "ttyd", kind: "binary", requiresSudo: false });
+      }
       return { satisfied: missing.length === 0, missing };
     })
-    .post("/install", () => {
-      const pendingSudo = checks
-        .filter((bin) => !whichSync(bin))
-        .map((name) => ({
-          name,
-          command: installCmds[name] ?? `(see install docs for ${name})`,
-          reason: `${name} is required for tmux session backend.`,
-        }));
+    .post("/install", async () => {
+      const installed: string[] = [];
+      const pendingSudo: Array<{
+        name: string;
+        command: string;
+        reason: string;
+      }> = [];
+      const errors: string[] = [];
+
+      // tmux: package-manager only — always defer to a sudo instruction.
+      if (!whichSync("tmux")) {
+        pendingSudo.push({
+          name: "tmux",
+          command: tmuxManualInstall(),
+          reason: "tmux is required for the tmux session backend.",
+        });
+      }
+
+      // ttyd: auto-download the static binary into the agent cache (no sudo —
+      // the cache lives under the user's home dir). Already resolvable? skip.
+      if (resolveBinary("ttyd") || whichSync("ttyd")) {
+        // nothing to do for ttyd
+      } else {
+        try {
+          await installBinary({
+            name: "ttyd",
+            downloads: TTYD_DOWNLOADS,
+            versionMatcher: "ttyd version",
+          });
+          installed.push("ttyd");
+        } catch (err) {
+          // Auto-download failed (offline, unsupported arch — e.g. macOS,
+          // which ships no static ttyd binary). Fall back to a manual
+          // instruction so the operator can still recover.
+          const message = err instanceof Error ? err.message : String(err);
+          pendingSudo.push({
+            name: "ttyd",
+            command: ttydManualInstall(),
+            reason: `ttyd auto-download failed: ${message}`,
+          });
+          errors.push(message);
+        }
+      }
+
       return {
-        ok: true,
-        installed: [],
+        ok: errors.length === 0,
+        installed,
         pendingSudo,
-        errors: [],
+        errors,
       };
     })
     .post("/uninstall", () => ({ ok: true }));
@@ -1821,7 +1950,7 @@ export const createPlugin: VibePluginFactory = (
       {
         name: "ttyd",
         kind: "binary",
-        requiresSudo: true,
+        requiresSudo: false,
       },
     ],
 
