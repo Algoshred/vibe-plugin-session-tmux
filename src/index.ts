@@ -940,9 +940,18 @@ class TmuxSessionProvider implements SessionProvider {
       return existing;
     }
 
-    // Find available port via SDK helper
+    // Find an available port via the SDK helper, but start the scan ABOVE the
+    // highest port we've already handed out. `findAvailablePort` only OS-probes
+    // free ports — during the window between assigning a port and ttyd actually
+    // binding it (the sleep below), a concurrent/back-to-back start would
+    // otherwise re-pick the same not-yet-bound port and one ttyd would die on
+    // bind. Excluding in-flight ports makes per-session ports collision-free.
+    const inUsePorts = [...this.ttydPorts.values()];
+    const scanStart = inUsePorts.length
+      ? Math.max(TTYD_BASE_PORT, Math.max(...inUsePorts) + 1)
+      : TTYD_BASE_PORT;
     const assignedPort =
-      port ?? (await findAvailablePort(TTYD_BASE_PORT, TTYD_PORT_RANGE));
+      port ?? (await findAvailablePort(scanStart, TTYD_PORT_RANGE));
 
     this.log.info("Starting ttyd terminal", {
       sessionId,
@@ -984,7 +993,14 @@ class TmuxSessionProvider implements SessionProvider {
       ],
       {
         stdout: "ignore",
-        stderr: "ignore",
+        // Pipe stderr so a ttyd that exits on launch (port already bound,
+        // missing tmux target, bad binary) is DIAGNOSABLE. Previously this was
+        // "ignore" + no liveness check, so a dead-on-arrival ttyd was stored
+        // with a soon-dead PID and only surfaced downstream as the opaque
+        // "Terminal not running for this session" (commonly on the 2nd+
+        // session). We drain it continuously (capped) so the pipe never blocks
+        // a long-lived ttyd, and read the captured text only if ttyd died.
+        stderr: "pipe",
         stdin: "ignore",
         env: ttydEnv as Record<string, string>,
       },
@@ -994,8 +1010,41 @@ class TmuxSessionProvider implements SessionProvider {
       throw new Error("Failed to start ttyd — no PID returned");
     }
 
-    // Give ttyd a moment to bind the port
+    let ttydStderr = "";
+    const stderrStream = child.stderr as ReadableStream<Uint8Array> | undefined;
+    if (stderrStream && typeof stderrStream.getReader === "function") {
+      void (async () => {
+        try {
+          const reader = stderrStream.getReader();
+          const dec = new TextDecoder();
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (ttydStderr.length < 4096)
+              ttydStderr += dec.decode(value, { stream: true });
+          }
+        } catch {
+          // stream closed/cancelled — nothing to capture
+        }
+      })();
+    }
+
+    // Give ttyd a moment to bind the port, then confirm it actually survived.
     await sleep(500);
+    if (child.exitCode !== null || !isProcessAlive(child.pid)) {
+      const detail = ttydStderr.trim().slice(0, 300) || "no stderr captured";
+      this.log.error("ttyd exited immediately after launch", {
+        sessionId,
+        tmuxName,
+        port: assignedPort,
+        exitCode: child.exitCode,
+        stderr: detail,
+      });
+      throw new Error(
+        `ttyd exited immediately (code ${child.exitCode ?? "unknown"}) on port ${assignedPort} ` +
+          `attaching tmux session "${tmuxName}": ${detail}`,
+      );
+    }
 
     // Store references
     this.ttydPids.set(sessionId, child.pid);
