@@ -1267,7 +1267,7 @@ class TmuxSessionProvider implements SessionProvider {
     try {
       // Prefer the provider-managed cache (absolute path, immune to the
       // Bun.which PATH snapshot) then fall back to a PATH lookup.
-      ttydOk = resolveBinary("ttyd") !== null || Bun.which("ttyd") !== null;
+      ttydOk = resolveBinary("ttyd") !== null || Bun.which("ttyd", { PATH: process.env.PATH }) !== null;
     } catch {
       // ttyd not found
     }
@@ -1829,7 +1829,7 @@ const provider = new TmuxSessionProvider();
 
 // Cross-platform binary discovery via Bun.which (handles PATHEXT on Windows).
 function whichSync(bin: string): string | null {
-  return Bun.which(bin) ?? null;
+  return Bun.which(bin, { PATH: process.env.PATH }) ?? null;
 }
 
 /** Manual install instruction for ttyd when auto-download is unavailable. */
