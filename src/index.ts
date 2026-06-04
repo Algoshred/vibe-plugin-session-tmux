@@ -115,17 +115,42 @@ const TTYD_DOWNLOADS: Partial<Record<ToolPlatform, BinaryDownload>> = {
 };
 
 /**
- * Resolve the ttyd binary path. Prefers the provider-managed cache (absolute
- * path, immune to the PATH snapshot `Bun.which` takes at process start — the
- * reason a freshly-downloaded ttyd was invisible to the running daemon), then
- * the bare name so the OS resolves it from PATH (or gives a sensible "command
- * not found").
+ * Resolve or install the ttyd binary path. Prefers the provider-managed cache
+ * (absolute path, immune to the PATH snapshot `Bun.which` takes at process
+ * start — the reason a freshly-downloaded ttyd was invisible to the running
+ * daemon), then PATH, and otherwise auto-downloads the static binary into the
+ * agent cache. This plugin OWNS ttyd: terminal startup must never fall back to
+ * a bare `ttyd`/`ttyd.exe` name, because Bun then surfaces an opaque
+ * "Executable not found in $PATH" ENOENT only AFTER the session was created on
+ * the agent — which the backend reports to the UI as a generic 500. Resolving
+ * (and installing if missing) up front makes the failure recoverable and the
+ * error message actionable. Mirrors the wezterm provider's `ensureTtydBinary`.
  */
-function resolveTtydCmd(): string {
-  return (
-    resolveBinary("ttyd") ??
-    (process.platform === "win32" ? "ttyd.exe" : "ttyd")
-  );
+async function ensureTtydBinary(log?: BoundLogger): Promise<string> {
+  const existing = resolveBinary("ttyd");
+  if (existing) return existing;
+
+  log?.info("ttyd not found — attempting auto-install");
+  try {
+    const installed = await installBinary({
+      name: "ttyd",
+      downloads: TTYD_DOWNLOADS,
+      versionMatcher: "ttyd version",
+      log: {
+        info: (msg) => log?.info(msg),
+        warn: (msg) => log?.warn(msg),
+        error: (msg) => log?.error(msg),
+      },
+    });
+    log?.info("ttyd auto-installed", { path: installed });
+    return installed;
+  } catch (err) {
+    const cause = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `ttyd is not available and auto-install failed. ${ttydManualInstall()}. Cause: ${cause}`,
+      { cause: err },
+    );
+  }
 }
 
 /** The loopback host ttyd binds to — the agent's terminal proxy connects here. */
@@ -976,9 +1001,16 @@ class TmuxSessionProvider implements SessionProvider {
       }
     }
 
+    // Resolve (and auto-download if missing) the ttyd binary BEFORE spawning.
+    // Falling back to a bare "ttyd" name here let Bun throw an opaque ENOENT
+    // ("Executable not found in $PATH") only after the session had already been
+    // created on the agent, which the backend surfaced to the UI as a generic
+    // INTERNAL_SERVER_ERROR. Installing up front makes ttyd self-provisioning.
+    const ttydCmd = await ensureTtydBinary(this.log);
+
     const child = Bun.spawn(
       [
-        resolveTtydCmd(),
+        ttydCmd,
         "-t",
         "fontSize=14",
         "-t",
