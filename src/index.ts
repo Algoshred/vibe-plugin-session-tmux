@@ -321,6 +321,94 @@ function tmuxExecSilent(args: string[]): boolean {
 }
 
 /**
+ * Apply the terminal interaction defaults to a freshly created or adopted
+ * tmux session. Centralised (and exported for tests) so every create path
+ * — auto-named, explicit-name, adopt — stays in sync instead of drifting.
+ *
+ * Mouse mode is deliberately left **off**. With `mouse on`, the browser
+ * terminal (ttyd/xterm.js) hands every drag to tmux, which drops the pane
+ * into copy-mode — the user sees the "SCROLL MODE — press Esc or q" banner,
+ * the drag does not visibly highlight, and a mouse copy/paste is impossible
+ * without holding Shift. With `mouse off`, xterm.js owns the mouse at the
+ * shell prompt: a plain click-drag does a native selection that copies with
+ * Cmd/Ctrl+C and pastes with the browser — the iTerm2-style behaviour users
+ * expect. tmux still forwards the mouse to a full-screen pane app that
+ * requests it (claude, vim, htop, less), so those keep their own click and
+ * wheel scroll. Users who specifically want tmux's own wheel-scroll-into-
+ * history back can flip it per session via `toggleMouse()`.
+ *
+ * The OSC-52 clipboard bridge, the copy-mode drag-end bindings, and the
+ * scroll-mode banner only take effect once mouse mode is toggled on, but we
+ * configure them here (idempotently) so that path stays ergonomic too.
+ *
+ * `exec` is injectable so tests can capture the issued commands; it defaults
+ * to the real (non-throwing) tmux runner.
+ */
+export function applyTmuxSessionDefaults(
+  sessionName: string,
+  exec: (args: string[]) => boolean = tmuxExecSilent,
+): void {
+  // Native browser selection by default — see the doc comment for rationale.
+  exec(["set", "-t", sessionName, "mouse", "off"]);
+
+  // Clipboard / copy-paste ergonomics for the mouse-on path (iTerm2-style).
+  //
+  // When a user toggles `mouse on`, dragging selects in tmux copy-mode rather
+  // than the browser's native selection. To make that selection usable as a
+  // copy — and to stop the drag from leaving the pane "stuck" in copy-mode —
+  // we (a) turn on tmux's OSC-52 clipboard bridge so a copy reaches the
+  // browser clipboard through ttyd, and (b) bind mouse-drag-end (both vi and
+  // emacs copy-mode tables) to copy-the-selection-and-exit. `set-clipboard` is
+  // session-scoped (`set -t`); the copy-mode key bindings are server-global
+  // (tmux key tables aren't per-session) but idempotent — re-binding the same
+  // key on every create is harmless.
+  exec(["set", "-t", sessionName, "set-clipboard", "on"]);
+  exec([
+    "bind-key",
+    "-T",
+    "copy-mode",
+    "MouseDragEnd1Pane",
+    "send-keys",
+    "-X",
+    "copy-pipe-and-cancel",
+  ]);
+  exec([
+    "bind-key",
+    "-T",
+    "copy-mode-vi",
+    "MouseDragEnd1Pane",
+    "send-keys",
+    "-X",
+    "copy-pipe-and-cancel",
+  ]);
+
+  // Scroll-mode (copy-mode) banner.
+  //
+  // When mouse mode is on, scrolling up puts the pane in tmux copy-mode, where
+  // keystrokes drive selection/navigation instead of reaching the shell —
+  // users perceive this as "the terminal is frozen / I can't type". ttyd
+  // renders whatever tmux draws, so we surface a prominent banner on the
+  // pane's top border whenever copy-mode is active, and hide it otherwise.
+  // Both the format and the pane-mode-changed hook are scoped to this session
+  // (`set -t` / `set-hook -t`) so neither leaks into unrelated tmux sessions
+  // on the same server.
+  exec([
+    "set",
+    "-t",
+    sessionName,
+    "pane-border-format",
+    " #[align=centre]#[bg=colour208,fg=black,bold] ⬆ SCROLL MODE — press Esc or q to resume typing ⬆ #[default]",
+  ]);
+  exec([
+    "set-hook",
+    "-t",
+    sessionName,
+    "pane-mode-changed",
+    'if -F "#{pane_in_mode}" "set-option -w pane-border-status top" "set-option -w pane-border-status off"',
+  ]);
+}
+
+/**
  * Get the current ISO timestamp.
  */
 function nowISO(): string {
@@ -548,7 +636,7 @@ class TmuxSessionProvider implements SessionProvider {
           tmuxExecSilent(["set-environment", "-t", target, k, v]);
         }
       }
-      tmuxExecSilent(["set", "-t", target, "mouse", "on"]);
+      applyTmuxSessionDefaults(target);
       if (config.command)
         tmuxExecSilent(["send-keys", "-t", target, config.command, "Enter"]);
       const id = target.startsWith("vibe-")
@@ -646,68 +734,9 @@ class TmuxSessionProvider implements SessionProvider {
       }
     }
 
-    // Enable mouse by default
-    tmuxExecSilent(["set", "-t", sessionName, "mouse", "on"]);
-
-    // Clipboard / copy-paste ergonomics (iTerm2-style).
-    //
-    // With `mouse on`, dragging selects in tmux copy-mode rather than the
-    // browser's native selection. To make that selection actually usable as a
-    // copy — and to stop the drag from leaving the pane "stuck" in copy-mode —
-    // we (a) turn on tmux's OSC-52 clipboard bridge so a copy reaches the
-    // browser clipboard through ttyd, and (b) bind mouse-drag-end (both vi and
-    // emacs copy-mode tables) to copy-the-selection-and-exit. Net effect: drag
-    // to select → release → it's on your clipboard and you're back at the
-    // prompt, like a native terminal. (Holding Shift still does a pure browser
-    // selection, bypassing tmux entirely — surfaced as a hint in the web UI.)
-    // `set-clipboard` is session-scoped (`set -t`); the copy-mode key bindings
-    // are server-global (tmux key tables aren't per-session) but idempotent —
-    // re-binding the same key on every create is harmless.
-    tmuxExecSilent(["set", "-t", sessionName, "set-clipboard", "on"]);
-    tmuxExecSilent([
-      "bind-key",
-      "-T",
-      "copy-mode",
-      "MouseDragEnd1Pane",
-      "send-keys",
-      "-X",
-      "copy-pipe-and-cancel",
-    ]);
-    tmuxExecSilent([
-      "bind-key",
-      "-T",
-      "copy-mode-vi",
-      "MouseDragEnd1Pane",
-      "send-keys",
-      "-X",
-      "copy-pipe-and-cancel",
-    ]);
-
-    // Scroll-mode (copy-mode) banner.
-    //
-    // With mouse on, scrolling up puts the pane in tmux copy-mode, where
-    // keystrokes drive selection/navigation instead of reaching the shell —
-    // users perceive this as "the terminal is frozen / I can't type". ttyd
-    // renders whatever tmux draws, so we surface a prominent banner on the
-    // pane's top border whenever copy-mode is active, and hide it otherwise.
-    // Both the format and the pane-mode-changed hook are scoped to this
-    // session (`set -t` / `set-hook -t`) so neither leaks into unrelated
-    // tmux sessions on the same server. (`set -g` would overwrite the
-    // pane-border-format globally for every session on the tmux server.)
-    tmuxExecSilent([
-      "set",
-      "-t",
-      sessionName,
-      "pane-border-format",
-      " #[align=centre]#[bg=colour208,fg=black,bold] ⬆ SCROLL MODE — press Esc or q to resume typing ⬆ #[default]",
-    ]);
-    tmuxExecSilent([
-      "set-hook",
-      "-t",
-      sessionName,
-      "pane-mode-changed",
-      'if -F "#{pane_in_mode}" "set-option -w pane-border-status top" "set-option -w pane-border-status off"',
-    ]);
+    // Terminal interaction defaults (mouse off → native browser selection,
+    // plus the copy-mode ergonomics that apply once mouse mode is toggled on).
+    applyTmuxSessionDefaults(sessionName);
 
     // If an initial command is given, send it — but only for a freshly
     // created session. Never re-inject the command into a tmux we adopted on
@@ -1049,6 +1078,20 @@ class TmuxSessionProvider implements SessionProvider {
         "fontSize=14",
         "-t",
         `theme={"background":"#1e1e1e","foreground":"#cccccc"}`,
+        // Native selection / copy ergonomics in xterm.js (ttyd forwards these
+        // straight to the Terminal constructor):
+        //   macOptionClickForcesSelection — let Mac users force a native
+        //     selection with Option+click even when a full-screen pane app has
+        //     mouse reporting on (matches iTerm2's Option-drag).
+        //   rightClickSelectsWord — right-click selects the word under the
+        //     cursor, so the browser's context-menu copy has something to grab.
+        //   scrollback — keep a generous local scrollback buffer.
+        "-t",
+        "macOptionClickForcesSelection=true",
+        "-t",
+        "rightClickSelectsWord=true",
+        "-t",
+        "scrollback=10000",
         "--writable",
         "--port",
         String(assignedPort),
@@ -1333,7 +1376,9 @@ class TmuxSessionProvider implements SessionProvider {
     try {
       // Prefer the provider-managed cache (absolute path, immune to the
       // Bun.which PATH snapshot) then fall back to a PATH lookup.
-      ttydOk = resolveBinary("ttyd") !== null || Bun.which("ttyd", { PATH: process.env.PATH }) !== null;
+      ttydOk =
+        resolveBinary("ttyd") !== null ||
+        Bun.which("ttyd", { PATH: process.env.PATH }) !== null;
     } catch {
       // ttyd not found
     }
@@ -1502,6 +1547,11 @@ class TmuxSessionProvider implements SessionProvider {
       }
       return (await this.getInfo(id)) ?? existing;
     }
+
+    // Normalise interaction defaults on adopt too: a session created by an
+    // older agent build may still carry `mouse on`, which would re-introduce
+    // the copy-mode "scroll mode" trap. configureTmuxSession is idempotent.
+    applyTmuxSessionDefaults(tmuxName);
 
     const now = nowISO();
     const pid = this.getSessionPanePid(tmuxName);

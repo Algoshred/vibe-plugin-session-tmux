@@ -20,6 +20,7 @@
     "format": "bunx prettier . --write",
     "format:check": "bunx prettier . --check",
     "type:check": "tsc --noEmit",
+    "test": "bun test",
     "clean": "rimraf dist",
     "prebuild": "bun run clean",
     "prepublishOnly": "bun run build",
