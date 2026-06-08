@@ -649,6 +649,40 @@ class TmuxSessionProvider implements SessionProvider {
     // Enable mouse by default
     tmuxExecSilent(["set", "-t", sessionName, "mouse", "on"]);
 
+    // Clipboard / copy-paste ergonomics (iTerm2-style).
+    //
+    // With `mouse on`, dragging selects in tmux copy-mode rather than the
+    // browser's native selection. To make that selection actually usable as a
+    // copy — and to stop the drag from leaving the pane "stuck" in copy-mode —
+    // we (a) turn on tmux's OSC-52 clipboard bridge so a copy reaches the
+    // browser clipboard through ttyd, and (b) bind mouse-drag-end (both vi and
+    // emacs copy-mode tables) to copy-the-selection-and-exit. Net effect: drag
+    // to select → release → it's on your clipboard and you're back at the
+    // prompt, like a native terminal. (Holding Shift still does a pure browser
+    // selection, bypassing tmux entirely — surfaced as a hint in the web UI.)
+    // `set-clipboard` is session-scoped (`set -t`); the copy-mode key bindings
+    // are server-global (tmux key tables aren't per-session) but idempotent —
+    // re-binding the same key on every create is harmless.
+    tmuxExecSilent(["set", "-t", sessionName, "set-clipboard", "on"]);
+    tmuxExecSilent([
+      "bind-key",
+      "-T",
+      "copy-mode",
+      "MouseDragEnd1Pane",
+      "send-keys",
+      "-X",
+      "copy-pipe-and-cancel",
+    ]);
+    tmuxExecSilent([
+      "bind-key",
+      "-T",
+      "copy-mode-vi",
+      "MouseDragEnd1Pane",
+      "send-keys",
+      "-X",
+      "copy-pipe-and-cancel",
+    ]);
+
     // Scroll-mode (copy-mode) banner.
     //
     // With mouse on, scrolling up puts the pane in tmux copy-mode, where
