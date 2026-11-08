@@ -60,10 +60,10 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/algoshred/vibe-plugin-session-tmux.git"
+    "url": "git+https://github.com/Algoshred/vibe-plugin-session-tmux.git"
   },
   "bugs": {
-    "url": "https://github.com/algoshred/vibe-plugin-session-tmux/issues"
+    "url": "https://github.com/Algoshred/vibe-plugin-session-tmux/issues"
   },
   "homepage": "https://vibecontrols.com",
   "publishConfig": {
